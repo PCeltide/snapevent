@@ -1,0 +1,31 @@
+[package]
+name = "kdp-cli"
+description = "Command driver for the Kalshi data pipeline."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kdp-cli"
+path = "src/main.rs"
+
+[dependencies]
+kdp-core.workspace = true
+kdp-kalshi.workspace = true
+kdp-store.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Loads .env at startup so credentials stay out of settings/git.
+dotenvy.workspace = true
+# Backfill stamps recv_ts / computes unix times; capture tests build Timestamps.
+chrono.workspace = true

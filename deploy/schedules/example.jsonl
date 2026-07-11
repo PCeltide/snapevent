@@ -1,0 +1,2 @@
+{"id":"cup-m1","label":"Alpha vs Beta (example)","series":"KXCUPMATCH","event_ticker":"KXCUPMATCH-26JUN121330AAABBB","teams":["AAA","BBB"],"start_utc":"2026-06-12T13:30:00Z","arm_lead_min":60,"max_hours":8,"remote_prefix":"remote:kdp/cup-2026"}
+{"id":"cup-m2","label":"Gamma vs Delta (example; resolve by teams)","series":"KXCUPMATCH","event_ticker":null,"teams":["CCC","DDD"],"start_utc":"2026-06-13T13:30:00Z","arm_lead_min":60,"max_hours":8,"remote_prefix":"remote:kdp/cup-2026"}

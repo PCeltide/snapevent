@@ -1,0 +1,11 @@
+# Oneshot watchdog. Run by kdp-health.timer.
+[Unit]
+Description=kdp health watchdog (disk / failed units / stale capture)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=kdp
+Group=kdp
+EnvironmentFile=/etc/kdp/kdp.env
+ExecStart=/opt/kdp/bin/kdp-health.sh

@@ -1,0 +1,11 @@
+# Run the archive nightly at 03:30 UTC (a quiet hour; adjust to taste).
+[Unit]
+Description=kdp nightly archive to Google Drive
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,91 @@
+# Workspace root for kdp.
+#
+# Six crates, layered so the pure data types have no I/O and no runtime, the
+# I/O crates depend on them, and the binaries depend on the I/O crates:
+#
+#   kdp-core    (lib)  pure serde + chrono domain types, no I/O
+#   kdp-kalshi  (lib)  Kalshi REST + WebSocket clients -> kdp-core types
+#   kdp-store   (lib)  append-only JSONL writer with daily rotation
+#   kdp-cli     (bin)  command driver wiring the above together
+#   kdp-process (bin)  offline JSONL -> compressed columnar processor
+#   kdp-load    (lib)  deterministic typed replay over processed dirs (leaf)
+#
+# Shared dependency versions are pinned once here in [workspace.dependencies]
+# and inherited by crates via `<dep>.workspace = true`, so versions can never
+# drift between crates.
+
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# --- async runtime -------------------------------------------------------
+tokio = { version = "1", features = ["full"] }
+
+# --- http ----------------------------------------------------------------
+# Default features keep TLS on the platform-native stack (schannel on Windows),
+# which needs no extra build tooling. See README "TLS / portability".
+reqwest = { version = "0.12", features = ["json"] }
+
+# --- websocket -----------------------------------------------------------
+# Cataloged for the Phase 2 live L2 capture path; not consumed by any crate yet.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# --- serde ---------------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- error handling ------------------------------------------------------
+anyhow = "1"      # application-level (binary) errors
+thiserror = "2"   # typed library errors
+
+# --- observability -------------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- time ----------------------------------------------------------------
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- crypto (RSA-PSS-SHA256 request signing) -----------------------------
+# Cataloged for the Phase 2 authenticated-endpoint work; not consumed yet.
+rsa = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+# Randomness for RSA-PSS signing (pairs with rsa 0.9 / rand_core 0.6).
+rand = "0.8"
+
+# --- websocket / async streams (Phase 2 live capture) --------------------
+# futures-util for SinkExt/StreamExt + .split() on the split WS stream.
+futures-util = "0.3"
+
+# --- filesystem (disk-space guard) ---------------------------------------
+# fs4 = maintained fork of fs2; cross-platform available_space, no unsafe.
+# (version verified at first consumption in Phase 2.6)
+fs4 = "0.13"
+
+# --- env / config --------------------------------------------------------
+# dotenvy loads .env at CLI startup so secrets stay out of settings/git.
+dotenvy = "0.15"
+
+# --- offline processing (kdp-process: JSONL -> compressed Parquet) --------
+# arrow + parquet (arrow-rs, lockstep versions). Heavy, but isolated in the
+# kdp-process binary so the capture tool stays lean. ZSTD compression + the
+# `arrow` integration ship in parquet's default features; the `ipc` feature on
+# arrow enables the Feather (Arrow IPC) writer for `--format feather`.
+arrow = { version = "58", features = ["ipc"] }
+parquet = "58"
+
+# --- internal crates (path) ---------------------------------------------
+kdp-core = { path = "crates/kdp-core" }
+kdp-kalshi = { path = "crates/kdp-kalshi" }
+kdp-store = { path = "crates/kdp-store" }
+
+# Workspace-wide lints, inherited by each crate via `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "forbid"

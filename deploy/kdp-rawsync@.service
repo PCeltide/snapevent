@@ -1,0 +1,18 @@
+# kdp rolling in-flight raw backup (one session instance), triggered by
+# kdp-rawsync@<session>.timer. Additive rclone copy of the live raw JSONL to
+# $KDP_RCLONE_REMOTE/<session>/raw-inflight/ — a mid-event safety net. Runs as root so
+# it can stop its own timer once capture goes inactive.
+[Unit]
+Description=kdp rolling in-flight raw backup to Drive (session %i)
+Documentation=https://github.com/PCeltide/snapevent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/kdp/kdp.env
+EnvironmentFile=-/etc/kdp/sessions/%i.env
+ExecStart=/opt/kdp/bin/kdp-rawsync.sh %i
+# Never compete with capture for CPU/IO — this is a background safety net.
+Nice=10
+IOSchedulingClass=idle

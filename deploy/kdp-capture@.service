@@ -1,0 +1,48 @@
+# kdp Kalshi capture, one instance per capture session.
+#   systemctl start  kdp-capture@2026-06-12-AAABBB
+#   systemctl stop   kdp-capture@2026-06-12-AAABBB
+# %i is the session name -> data dir /var/lib/kdp/data/%i and Drive folder kdp/%i.
+[Unit]
+Description=kdp Kalshi L2+trade capture (session %i)
+Documentation=https://github.com/PCeltide/snapevent
+After=network-online.target chrony.service
+Wants=network-online.target
+# Never stop restarting capture, even under a rapid crash-loop: disable the
+# start-rate limiter. (StartLimit* are only honoured in [Unit]; when placed in
+# [Service] systemd ignores them and the DEFAULT 5-starts/10s limit applies,
+# which would let systemd give up and leave a 24/7 capture dead.)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=kdp
+Group=kdp
+# Base config (API key id, key path, KDP_TICKERS, KDP_IDLE), plus an optional
+# per-session override file (the leading '-' makes it non-fatal if absent).
+EnvironmentFile=/etc/kdp/kdp.env
+EnvironmentFile=-/etc/kdp/sessions/%i.env
+ExecStartPre=/usr/bin/install -d -o kdp -g kdp /var/lib/kdp/data/%i
+# No --duration: run until stopped; restart on any exit so a crash/blip never
+# leaves capture down (in-process reconnect handles transient drops itself).
+ExecStart=/opt/kdp/bin/kdp-cli capture --tickers ${KDP_TICKERS} --out /var/lib/kdp/data/%i --idle ${KDP_IDLE}
+# Mark the session settled when capture stops, so the archiver can pick it up.
+ExecStopPost=/bin/sh -c 'touch /var/lib/kdp/data/%i/.done'
+# The capture shuts down cleanly on SIGINT (its ctrl-c path). Make systemd send
+# SIGINT (not the default SIGTERM) so `systemctl stop` / reboot flush + finalize
+# gracefully instead of hard-killing.
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=always
+RestartSec=2
+# Capture must win CPU/IO over any co-located strategy process.
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+# Hardening: only /var/lib/kdp is writable; no new privileges; home hidden.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kdp
+
+[Install]
+WantedBy=multi-user.target

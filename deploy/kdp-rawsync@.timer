@@ -1,0 +1,15 @@
+# Rolling in-flight raw backup cadence for one capture session. Start it
+# alongside capture:  systemctl start kdp-rawsync@<session>.timer
+# It self-stops after capture goes inactive (the service does a final sync then
+# stops this timer). First sync 30s after arming, then every 3 minutes.
+[Unit]
+Description=kdp rolling in-flight raw backup timer (session %i)
+
+[Timer]
+OnActiveSec=30
+OnUnitActiveSec=180
+AccuracySec=15s
+Unit=kdp-rawsync@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,20 @@
+[package]
+name = "kdp-store"
+description = "Append-only JSONL writer with daily rotation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Cross-platform free-space query for the disk guard (sync feature = std API).
+fs4.workspace = true

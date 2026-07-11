@@ -1,0 +1,19 @@
+[package]
+name = "kdp-core"
+description = "Shared, I/O-free domain types for the Kalshi data pipeline."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+# serde_json is a runtime dep (not just dev): RawFallback.payload preserves the
+# original wire message verbatim as a serde_json::Value. Still pure / no I/O.
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

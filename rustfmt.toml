@@ -1,0 +1,7 @@
+max_width = 100
+# NOTE: `imports_granularity` is a nightly-only rustfmt option. On the stable
+# toolchain it is parsed but not applied (rustfmt prints a one-line warning and
+# proceeds; `cargo fmt --check` still succeeds). It is declared here so imports
+# are collapsed per-crate once formatting runs under a nightly rustfmt, without
+# changing the project's stable-only build policy. See ADR-001.
+imports_granularity = "Crate"

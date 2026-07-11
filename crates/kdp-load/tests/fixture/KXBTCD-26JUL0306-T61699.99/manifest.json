@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.1.0",
+  "ticker": "KXBTCD-26JUL0306-T61699.99",
+  "format": "parquet",
+  "processed_at": "2026-07-06T07:52:52.687910500+00:00",
+  "source_dir": "scratch/universe-smoke/data/KXBTCD-26JUL0306\\KXBTCD-26JUL0306-T61699.99",
+  "source_files": [
+    {
+      "channel": "orderbook",
+      "path": "scratch/universe-smoke/data/KXBTCD-26JUL0306\\KXBTCD-26JUL0306-T61699.99\\orderbook\\2026-07-03.jsonl",
+      "records": 2825
+    },
+    {
+      "channel": "trade",
+      "path": "scratch/universe-smoke/data/KXBTCD-26JUL0306\\KXBTCD-26JUL0306-T61699.99\\trade\\2026-07-03.jsonl",
+      "records": 18
+    }
+  ],
+  "first_recv_ts_us": 1783071744797624,
+  "last_recv_ts_us": 1783071840689835,
+  "first_recv_ts": "2026-07-03T09:42:24.797624+00:00",
+  "last_recv_ts": "2026-07-03T09:44:00.689835+00:00",
+  "counts": {
+    "book_events": 2909,
+    "book_top": 2825,
+    "trades": 18,
+    "gaps": 0,
+    "raw": 0
+  },
+  "read_errors": 0,
+  "complete": true,
+  "notes": [
+    "all source records decoded into the structured tables; the raw capture files are safe to drop once these outputs are verified"
+  ],
+  "two_sided": true,
+  "two_sided_snapshots": 2825
+}

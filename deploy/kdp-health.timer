@@ -1,0 +1,11 @@
+# Run the watchdog every 5 minutes.
+[Unit]
+Description=kdp health watchdog schedule
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

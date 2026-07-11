@@ -1,0 +1,8 @@
+# Pin the toolchain so every contributor and CI run builds with the same
+# compiler. Stable only — this project must never depend on nightly features
+# (see docs/adr/ADR-001-language-choice.md). rustup auto-installs this toolchain
+# on the first cargo invocation in the workspace.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "default"

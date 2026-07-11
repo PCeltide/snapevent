@@ -1,0 +1,32 @@
+[package]
+name = "kdp-kalshi"
+description = "Kalshi REST + WebSocket clients producing kdp-core types."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+kdp-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+# RSA-PSS-SHA256 request signing (auth.rs). `pem` enables from_pkcs1_pem /
+# from_pkcs8_pem; the standalone sha2 crate provides the Sha256 digest.
+rsa = { workspace = true, features = ["pem"] }
+sha2.workspace = true
+base64.workspace = true
+rand.workspace = true
+
+# WebSocket live L2 feed: authenticated upgrade + framed message stream.
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,22 @@
+[Unit]
+Description=kdp forward hourly KXBTCD L2 + trade capture supervisor
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=kdp
+Group=kdp
+EnvironmentFile=/etc/kdp/kdp.env
+ExecStart=/opt/kdp/bin/kdp-cli capture-hourly \
+  --series ${KDP_HOURLY_SERIES} --band ${KDP_HOURLY_BAND} \
+  --out ${KDP_DATA_DIR} --grace ${KDP_SETTLE_GRACE} --poll ${KDP_SETTLE_POLL} \
+  --archive-cmd /opt/kdp/bin/kdp-archive.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

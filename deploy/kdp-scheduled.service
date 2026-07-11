@@ -1,0 +1,29 @@
+[Unit]
+Description=kdp scheduled event L2 + trade capture supervisor (sports etc.)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=kdp
+Group=kdp
+EnvironmentFile=/etc/kdp/kdp.env
+# Reads a declarative JSONL schedule (one event/line, series-agnostic); arms each
+# event at start-lead, resolves its markets (predicted ticker or by teams), then
+# captures L2+trades -> settle -> background archive (per-event-set Drive prefix
+# comes from each schedule entry's remote_prefix). Restart re-reads the file and
+# re-arms only events still ahead / in-window.
+ExecStart=/opt/kdp/bin/kdp-cli capture-scheduled \
+  --schedule ${KDP_SCHEDULE_FILE} \
+  --out ${KDP_DATA_DIR} \
+  --arm-lead-min ${KDP_SCHED_ARM_LEAD_MIN} --max-hours ${KDP_SCHED_MAX_HOURS} \
+  --grace ${KDP_SETTLE_GRACE} --poll ${KDP_SETTLE_POLL} \
+  --archive-cmd /opt/kdp/bin/kdp-archive.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

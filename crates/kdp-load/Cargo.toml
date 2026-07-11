@@ -1,0 +1,26 @@
+# kdp-load — deterministic typed replay over kdp-process output.
+#
+# A LEAF library: depends only on kdp-core within the workspace (arrow/parquet
+# stay internal, never leaked in the public API). Nothing in the workspace
+# depends on it; external consumers (e.g. a backtest framework) take it as a
+# git dependency. See docs/plans/2026-07-06-kdp-load-design.md.
+
+[package]
+name = "kdp-load"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic, time-ordered, typed event replay over kdp processed ticker directories"
+
+[lints]
+workspace = true
+
+[dependencies]
+kdp-core.workspace = true
+arrow.workspace = true
+parquet.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
