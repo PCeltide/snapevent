@@ -15,11 +15,12 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use kdp_core::RecordKind;
+use kdp_core::{Envelope, GapMarker, GapReason, RecordKind, Ticker};
 
 use crate::manifest::{us_to_rfc3339, Counts, Manifest, SourceFile, PROCESSED_SCHEMA_VERSION};
 use crate::reader::{read_envelopes, ReadError};
-use crate::tables::{BookEventsTable, BookTopTable, GapsTable, RawTable, TradesTable};
+use crate::tables::{BookEventsTable, BookTopTable, GapsTable, RawTable, TradesTable, VerifyTable};
+use crate::verify::VerifyEngine;
 use crate::writer::{write_batch, Format};
 use kdp_core::Book;
 
@@ -100,8 +101,18 @@ pub fn process_ticker(
     let mut trades = TradesTable::default();
     let mut gaps = GapsTable::default();
     let mut raw = RawTable::default();
+    let mut verify_table = VerifyTable::default();
+    // Gap rows are buffered, not pushed straight into `gaps`: stream gaps land
+    // here during the main loop below, and verify_mismatch rows (synthesized
+    // AFTER the loop, from the verify engine's finish()) are merged in here
+    // too, then the whole set is stable-sorted by recv_ts before writing --
+    // otherwise a mismatch timestamped earlier than a later stream gap would
+    // land in gaps.parquet out of order, and kdp-load's merge (which assumes
+    // gaps are recv_ts-ordered) would refuse the ticker with `OrderViolation`.
+    let mut gap_rows: Vec<(Envelope, GapMarker)> = Vec::new();
 
     let mut book = Book::default();
+    let mut engine = VerifyEngine::new();
     let mut event_idx: i64 = 0;
     let mut read_errors: Vec<ReadError> = Vec::new();
     let mut first_recv: Option<i64> = None;
@@ -135,6 +146,7 @@ pub fn process_ticker(
                         event_idx += 1;
                         book_events.push_snapshot(idx, &env, s)?;
                         book.apply_snapshot(s);
+                        engine.on_book_event(recv, &book, true);
                         let evt = s.ts.0.timestamp_micros();
                         let top = book.top();
                         if top.yes_bid_micro.is_some() && top.yes_ask_micro.is_some() {
@@ -147,6 +159,7 @@ pub fn process_ticker(
                         event_idx += 1;
                         book_events.push_delta(idx, &env, d);
                         book.apply_delta(d);
+                        engine.on_book_event(recv, &book, false);
                         let evt = d.ts.0.timestamp_micros();
                         let top = book.top();
                         if top.yes_bid_micro.is_some() && top.yes_ask_micro.is_some() {
@@ -155,8 +168,22 @@ pub fn process_ticker(
                         book_top.push(idx, &env, evt, "delta", &top);
                     }
                     RecordKind::Trade(t) => trades.push(&env, t)?,
-                    RecordKind::Gap(g) => gaps.push(&env, g),
+                    RecordKind::Gap(g) => {
+                        // Buffer (not push directly): see `gap_rows` doc above.
+                        gap_rows.push((env.clone(), g.clone()));
+                        // Only an orderbook-channel gap makes the replayed L2
+                        // book suspect; a trade-tape hole says nothing about
+                        // book fidelity, so it must not gate verify verdicts.
+                        if channel == "orderbook" {
+                            engine.on_gap();
+                        }
+                    }
                     RecordKind::Raw(r) => raw.push(&env, channel, r),
+                    // A verify record is a REST observation, not a stream event: it
+                    // never touches `book_events`/`book`/`event_idx`, and only ever
+                    // appears in the orderbook channel, so feeding it to `engine`
+                    // here keeps the engine's view in orderbook stream order.
+                    RecordKind::Verify(v) => engine.on_verify(recv, &v.yes, &v.no, &book),
                 }
             }
             source_files.push(SourceFile {
@@ -167,6 +194,75 @@ pub fn process_ticker(
         }
     }
 
+    // The stream is fully replayed; `book.underflows` is now the session total.
+    let underflows = book.underflows;
+
+    // Resolve every verify check the engine is still holding (a trailing
+    // pending check becomes "truncated"), then fold the outcomes into
+    // `verify_table` and, for each mismatch, a synthesized `verify_mismatch`
+    // gaps row -- pushed before `gaps.finish()` below so it lands in the table.
+    let verify_rows = engine.finish();
+    let verify_checks = verify_rows.len();
+    let mut verify_mismatches = 0usize;
+    let mut verify_skipped = 0usize;
+    for row in &verify_rows {
+        match row.outcome {
+            "mismatch" => {
+                verify_mismatches += 1;
+                tracing::warn!(
+                    ticker,
+                    recv_ts_us = row.recv_ts_us,
+                    detail = %row.detail,
+                    "verify mismatch: replayed book diverged from REST observation"
+                );
+                match chrono::DateTime::<chrono::Utc>::from_timestamp_micros(row.recv_ts_us) {
+                    Some(dt) => {
+                        let marker = GapMarker {
+                            reason: GapReason::VerifyMismatch,
+                            ticker: Ticker(ticker.to_string()),
+                            channel: "orderbook".to_string(),
+                            last_seq: None,
+                            observed_seq: None,
+                            detail: row.detail.clone(),
+                        };
+                        let env =
+                            Envelope::new(dt.into(), None, None, RecordKind::Gap(marker.clone()));
+                        gap_rows.push((env, marker));
+                    }
+                    None => {
+                        // Out-of-range micros can't be round-tripped through
+                        // `Timestamp`; still record the mismatch in the verify
+                        // table/manifest counts, just without a gaps row.
+                        tracing::warn!(
+                            ticker,
+                            recv_ts_us = row.recv_ts_us,
+                            "verify mismatch could not be stamped into gaps (timestamp out of range)"
+                        );
+                    }
+                }
+            }
+            "skipped_gap" | "truncated" => verify_skipped += 1,
+            _ => {}
+        }
+        verify_table.push(row);
+    }
+    if underflows > 0 {
+        tracing::warn!(
+            ticker,
+            underflows,
+            "book underflow(s) detected during replay"
+        );
+    }
+
+    // Flush the buffered gap rows (stream gaps + synthesized verify_mismatch
+    // rows) into the table in recv_ts order. A stable sort keeps same-timestamp
+    // rows in their original relative order (stream gaps in file order; a
+    // synthesized row after whatever real gap shares its instant).
+    gap_rows.sort_by_key(|(env, _)| env.recv_ts.0.timestamp_micros());
+    for (env, marker) in &gap_rows {
+        gaps.push(env, marker);
+    }
+
     // Finish all builders first; the batch row counts are the single source of
     // truth for the manifest (no separate length bookkeeping to drift).
     let book_events = book_events.finish()?;
@@ -174,12 +270,14 @@ pub fn process_ticker(
     let trades = trades.finish()?;
     let gaps = gaps.finish()?;
     let raw = raw.finish()?;
+    let verify_batch = verify_table.finish()?;
     let counts = Counts {
         book_events: book_events.num_rows(),
         book_top: book_top.num_rows(),
         trades: trades.num_rows(),
         gaps: gaps.num_rows(),
         raw: raw.num_rows(),
+        verify: verify_batch.num_rows(),
     };
 
     let ticker_out = out_dir.join(ticker);
@@ -198,9 +296,16 @@ pub fn process_ticker(
     )?;
     write_batch(&trades, &ticker_out.join(format!("trades.{ext}")), format)?;
     write_batch(&gaps, &ticker_out.join(format!("gaps.{ext}")), format)?;
-    // Only emit `raw` when there is something to preserve.
+    // Only emit `raw` / `verify` when there is something to preserve.
     if counts.raw > 0 {
         write_batch(&raw, &ticker_out.join(format!("raw.{ext}")), format)?;
+    }
+    if counts.verify > 0 {
+        write_batch(
+            &verify_batch,
+            &ticker_out.join(format!("verify.{ext}")),
+            format,
+        )?;
     }
 
     if !read_errors.is_empty() {
@@ -232,6 +337,18 @@ pub fn process_ticker(
             read_errors.len()
         ));
     }
+    if verify_mismatches > 0 {
+        notes.push(format!(
+            "{} verify mismatch(es): the replayed book diverged from the venue's REST orderbook at those instants; see verify.{ext} + the verify_mismatch gaps rows",
+            verify_mismatches
+        ));
+    }
+    if underflows > 0 {
+        notes.push(format!(
+            "{} book underflow(s): deltas drove levels strictly below zero during replay -- consistency signal, see manifest",
+            underflows
+        ));
+    }
     if complete {
         notes.push(
             "all source records decoded into the structured tables; the raw capture files are safe to drop once these outputs are verified".to_string(),
@@ -260,6 +377,10 @@ pub fn process_ticker(
         notes,
         two_sided: two_sided_snapshots > 0,
         two_sided_snapshots,
+        verify_checks,
+        verify_mismatches,
+        verify_skipped,
+        underflows,
     };
     manifest.write(&ticker_out.join("manifest.json"))?;
 
@@ -377,6 +498,17 @@ mod tests {
             .unwrap()
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+    }
+
+    fn col_str<'a>(
+        b: &'a arrow::record_batch::RecordBatch,
+        name: &str,
+    ) -> &'a arrow::array::StringArray {
+        b.column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
             .unwrap()
     }
 
@@ -574,6 +706,205 @@ mod tests {
             "book with both sides must be flagged two_sided"
         );
         assert_eq!(m["two_sided_snapshots"], 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn matching_verify_is_recorded_matched_with_no_gap_synthesis() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-VM","ts":"2026-06-02T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        let delta = r#"{"v":1,"recv_ts":"2026-06-02T00:00:01Z","seq":2,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-VM","ts":"2026-06-02T00:00:01Z","side":"yes","price":450000,"delta":50}}"#;
+        // Matches the replayed book exactly (450000: 100+50 = 150).
+        let verify = r#"{"v":2,"recv_ts":"2026-06-02T00:00:02Z","kind":"verify","data":{"ticker":"KDPTEST-VM","ts":"2026-06-02T00:00:02Z","yes":[{"price":450000,"quantity":150}],"no":[]}}"#;
+        let root = fixture_ob_lines("verify_match", "KDPTEST-VM", &[snap, delta, verify]);
+        let out = root.with_file_name("verify_match_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        let o = &outcomes[0];
+        assert_eq!(o.counts.verify, 1);
+        assert_eq!(o.counts.gaps, 0, "a matched verify synthesizes no gap");
+        assert!(o.complete);
+
+        let vb = read_one_batch(&out.join("KDPTEST-VM").join("verify.parquet"));
+        assert_eq!(vb.num_rows(), 1);
+        assert_eq!(col_str(&vb, "outcome").value(0), "matched");
+
+        let m = read_manifest(&out, "KDPTEST-VM");
+        assert_eq!(m["verify_checks"], 1);
+        assert_eq!(m["verify_mismatches"], 0);
+        assert_eq!(m["verify_skipped"], 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn mismatching_verify_resolved_past_window_synthesizes_a_gap_row() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-VX","ts":"2026-06-02T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        // REST claims a totally different book -- no match at the point, and
+        // nothing in the (empty-so-far) window matches either.
+        let verify = r#"{"v":2,"recv_ts":"2026-06-02T00:00:01Z","kind":"verify","data":{"ticker":"KDPTEST-VX","ts":"2026-06-02T00:00:01Z","yes":[{"price":500000,"quantity":999}],"no":[]}}"#;
+        // 7s after the verify record, past its 5s deadline (verify_ts + 5s = 6s) --
+        // this book event rescues nothing and resolves the pending check as mismatch.
+        let delta = r#"{"v":1,"recv_ts":"2026-06-02T00:00:08Z","seq":2,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-VX","ts":"2026-06-02T00:00:08Z","side":"yes","price":450000,"delta":10}}"#;
+        let root = fixture_ob_lines("verify_mismatch", "KDPTEST-VX", &[snap, verify, delta]);
+        let out = root.with_file_name("verify_mismatch_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        let o = &outcomes[0];
+        assert_eq!(o.counts.verify, 1);
+        assert_eq!(o.counts.gaps, 1, "the mismatch synthesizes one gap row");
+        assert!(o.complete, "a verify mismatch does not affect drop-safety");
+
+        let vb = read_one_batch(&out.join("KDPTEST-VX").join("verify.parquet"));
+        assert_eq!(col_str(&vb, "outcome").value(0), "mismatch");
+
+        let gb = read_one_batch(&out.join("KDPTEST-VX").join("gaps.parquet"));
+        assert_eq!(gb.num_rows(), 1);
+        assert_eq!(col_str(&gb, "reason").value(0), "verify_mismatch");
+        assert!(!col_str(&gb, "detail").value(0).is_empty());
+
+        let m = read_manifest(&out, "KDPTEST-VX");
+        assert_eq!(m["verify_mismatches"], 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_during_unresolved_gap_is_skipped_with_no_extra_gap_row() {
+        let gap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:00Z","seq":5,"sid":1,"kind":"gap","data":{"reason":"seq_jump","ticker":"KDPTEST-VG","channel":"orderbook","last_seq":5,"observed_seq":8,"detail":"seq jumped 5 -> 8"}}"#;
+        let verify = r#"{"v":2,"recv_ts":"2026-06-02T00:00:01Z","kind":"verify","data":{"ticker":"KDPTEST-VG","ts":"2026-06-02T00:00:01Z","yes":[],"no":[]}}"#;
+        let root = fixture_ob_lines("verify_skipped_gap", "KDPTEST-VG", &[gap, verify]);
+        let out = root.with_file_name("verify_skipped_gap_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        let o = &outcomes[0];
+        assert_eq!(o.counts.verify, 1);
+        // Only the original gap record -- a skipped_gap verdict synthesizes no
+        // additional gaps row (unlike a mismatch).
+        assert_eq!(o.counts.gaps, 1);
+
+        let vb = read_one_batch(&out.join("KDPTEST-VG").join("verify.parquet"));
+        assert_eq!(col_str(&vb, "outcome").value(0), "skipped_gap");
+
+        let m = read_manifest(&out, "KDPTEST-VG");
+        assert_eq!(m["verify_skipped"], 1);
+        assert_eq!(m["verify_mismatches"], 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn verify_unresolved_at_eof_is_truncated() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-VU","ts":"2026-06-02T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        // Mismatched and the last line -- never resolved by a forward event.
+        let verify = r#"{"v":2,"recv_ts":"2026-06-02T00:00:01Z","kind":"verify","data":{"ticker":"KDPTEST-VU","ts":"2026-06-02T00:00:01Z","yes":[{"price":999000,"quantity":1}],"no":[]}}"#;
+        let root = fixture_ob_lines("verify_truncated", "KDPTEST-VU", &[snap, verify]);
+        let out = root.with_file_name("verify_truncated_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        let o = &outcomes[0];
+        assert_eq!(o.counts.verify, 1);
+        assert_eq!(o.counts.gaps, 0, "truncated synthesizes no gap row");
+
+        let vb = read_one_batch(&out.join("KDPTEST-VU").join("verify.parquet"));
+        assert_eq!(col_str(&vb, "outcome").value(0), "truncated");
+
+        let m = read_manifest(&out, "KDPTEST-VU");
+        assert_eq!(m["verify_skipped"], 1);
+        assert_eq!(m["verify_mismatches"], 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn deltas_driving_a_level_below_zero_are_reported_as_underflows() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-VF","ts":"2026-06-02T00:00:00Z","yes":[{"price":410000,"quantity":100}],"no":[]}}"#;
+        // Overshoots the resting quantity below zero.
+        let delta = r#"{"v":1,"recv_ts":"2026-06-02T00:00:01Z","seq":2,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-VF","ts":"2026-06-02T00:00:01Z","side":"yes","price":410000,"delta":-300}}"#;
+        let root = fixture_ob_lines("underflow", "KDPTEST-VF", &[snap, delta]);
+        let out = root.with_file_name("underflow_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        let o = &outcomes[0];
+        assert!(o.complete, "an underflow does not affect drop-safety");
+
+        let m = read_manifest(&out, "KDPTEST-VF");
+        assert_eq!(m["underflows"], 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn gaps_table_stays_recv_ts_ordered_with_interleaved_verify_mismatch() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-VO","ts":"2026-06-02T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        // Mismatched REST observation at t1 -- nothing in the (empty) window
+        // matches, so this stays pending until a later book event or EOF.
+        let verify = r#"{"v":2,"recv_ts":"2026-06-02T00:00:01Z","kind":"verify","data":{"ticker":"KDPTEST-VO","ts":"2026-06-02T00:00:01Z","yes":[{"price":999000,"quantity":1}],"no":[]}}"#;
+        // 7s later, past the 5s deadline (verify_ts + 5s = 00:00:06Z): resolves
+        // the pending check as "mismatch", synthesizing a verify_mismatch gaps
+        // row stamped at t1 (the verify's own recv_ts), not at this delta's ts.
+        let delta = r#"{"v":1,"recv_ts":"2026-06-02T00:00:08Z","seq":2,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-VO","ts":"2026-06-02T00:00:08Z","side":"yes","price":450000,"delta":10}}"#;
+        // A real stream gap at t2 > t1, appended AFTER in file/capture order --
+        // this is the bug: pre-fix, this landed in gaps.parquet BEFORE the t1
+        // verify_mismatch row (synthesized after the loop), violating recv_ts
+        // order and tripping kdp-load's merge OrderViolation.
+        let gap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:10Z","seq":5,"sid":1,"kind":"gap","data":{"reason":"seq_jump","ticker":"KDPTEST-VO","channel":"orderbook","last_seq":5,"observed_seq":8,"detail":"seq jumped 5 -> 8"}}"#;
+        let root = fixture_ob_lines("gap_order", "KDPTEST-VO", &[snap, verify, delta, gap]);
+        let out = root.with_file_name("gap_order_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        let o = &outcomes[0];
+        assert_eq!(
+            o.counts.gaps, 2,
+            "one stream gap + one synthesized verify_mismatch"
+        );
+
+        let gb = read_one_batch(&out.join("KDPTEST-VO").join("gaps.parquet"));
+        let ts = col_i64(&gb, "recv_ts_us");
+        assert!(
+            ts.value(0) <= ts.value(1),
+            "gaps.parquet must be recv_ts-ordered (kdp-load's merge tripwires otherwise)"
+        );
+        assert_eq!(
+            col_str(&gb, "reason").value(0),
+            "verify_mismatch",
+            "the earlier-timestamped synthesized row must come first"
+        );
+        assert_eq!(col_str(&gb, "reason").value(1), "seq_jump");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn no_verify_records_means_no_verify_table_at_all() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-02T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-VN","ts":"2026-06-02T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        let root = fixture_ob_lines("no_verify", "KDPTEST-VN", &[snap]);
+        let out = root.with_file_name("no_verify_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        let o = &outcomes[0];
+        assert_eq!(o.counts.verify, 0);
+        assert!(
+            !out.join("KDPTEST-VN").join("verify.parquet").exists(),
+            "no verify records -> no verify table written"
+        );
+
+        let m = read_manifest(&out, "KDPTEST-VN");
+        assert_eq!(m["verify_checks"], 0);
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);

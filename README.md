@@ -27,6 +27,7 @@ is the data foundation for order-flow research.
 | **Capture** | `kdp-cli capture` | Live L2 order books (snapshots + deltas) + trades over WebSocket → append-only JSONL, with reconnect + inline gap markers. |
 | **Supervise** | `kdp-cli capture-hourly` / `capture-scheduled` / `capture-universe` | Long-running supervisors over the same capture spine: hourly laddered products, pre-scheduled events from a JSONL schedule, or every market matching a series filter — arm → capture → settle → archive, hands-off. |
 | **Backfill** | `kdp-cli backfill` | Historical trade tape over REST (cursor-paginated), per ticker or whole `--series`. |
+| **Browse** | `kdp-cli catalog` | What's on Kalshi, ranked by traded volume: categories → series → live markets; `--series` ends in a ready-to-run capture command. |
 | **Discover** | `kdp-cli discover` | Enumerate markets in a series / by status (find tickers to capture or backfill). |
 | **Process** | `kdp-process` | Raw JSONL → per-ticker columnar tables (lossless `book_events`, derived `book_top`, `trades`, `gaps`, + `manifest.json`). Parquet (default) or Feather. |
 | **Replay** | `kdp-load` (Rust lib) | Deterministic, time-ordered typed event stream over processed dirs: effective-timestamp merge, trade dedup, point-in-time book replay. |
@@ -115,6 +116,11 @@ powershell -File scripts/check.ps1
 # Smoke: toolchain + real public wire (no credentials needed).
 cargo run -p kdp-cli -- hello
 cargo run -p kdp-cli -- probe          # hits public /markets, reports count
+
+# What should I capture? Browse the venue, ranked by traded volume.
+cargo run -p kdp-cli -- catalog                        # categories
+cargo run -p kdp-cli -- catalog --category Crypto     # series in a category
+cargo run -p kdp-cli -- catalog --series KXBTCD       # live markets + a ready-to-run capture command
 
 # Discover markets in a series (e.g. IPL games), then capture / backfill.
 cargo run -p kdp-cli -- discover --series KXIPLGAME --status open

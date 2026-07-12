@@ -23,7 +23,11 @@ use crate::records::{OrderbookDelta, OrderbookSnapshot, Trade};
 /// Current envelope schema version. Bump when the on-disk shape changes; the
 /// `v` field lets a reader dispatch on the version it finds (see
 /// [`Envelope::validate`]).
-pub const ENVELOPE_VERSION: u16 = 1;
+///
+/// v2 added [`RecordKind::Verify`] and [`GapReason::VerifyMismatch`]; v1 lines
+/// remain readable (older-or-equal versions are accepted by
+/// [`Envelope::validate`]).
+pub const ENVELOPE_VERSION: u16 = 2;
 
 /// Errors from validating a (typically just-deserialized) [`Envelope`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -127,6 +131,10 @@ pub enum RecordKind {
     Gap(GapMarker),
     /// A message we could not decode, preserved verbatim.
     Raw(RawFallback),
+    /// An external REST orderbook observation fetched during capture for
+    /// offline cross-verification against the replayed book — NOT a stream
+    /// snapshot. Replay must never re-anchor the book on it.
+    Verify(OrderbookSnapshot),
 }
 
 /// Why a [`GapMarker`] was emitted.
@@ -142,6 +150,10 @@ pub enum GapReason {
     /// We deliberately resubscribed (e.g. after a seq jump) to obtain a fresh
     /// snapshot.
     Resubscribe,
+    /// The replayed book failed to match a REST verify observation within
+    /// kdp-process's tolerance window; synthesized by kdp-process at
+    /// verification time — never written by capture.
+    VerifyMismatch,
 }
 
 /// An inline marker recording a hole in a stream.
@@ -231,7 +243,7 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({
-                "v": 1,
+                "v": 2,
                 "recv_ts": ts_value(),
                 "kind": "snapshot",
                 "data": {
@@ -391,7 +403,7 @@ mod tests {
         // known behavior so the `v` + validate() version guard stays the
         // documented forward-compat mechanism (and a regression is caught).
         let line = serde_json::json!({
-            "v": 1,
+            "v": 2,
             "recv_ts": ts_value(),
             "extra_top_level": 99,
             "kind": "snapshot",
@@ -409,5 +421,78 @@ mod tests {
             env,
             Envelope::new(ts(), None, None, RecordKind::Snapshot(sample_snapshot()))
         );
+    }
+
+    #[test]
+    fn verify_envelope_has_verify_kind_and_current_version_and_round_trips() {
+        let env = Envelope::new(ts(), None, None, RecordKind::Verify(sample_snapshot()));
+        let value = serde_json::to_value(&env).expect("to_value");
+        assert_eq!(value["v"], 2);
+        assert_eq!(value["kind"], "verify");
+        assert_eq!(value["data"]["ticker"], "KXTEST");
+
+        let json = serde_json::to_string(&env).expect("serialize");
+        let back: Envelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+    }
+
+    #[test]
+    fn verify_mismatch_gap_reason_serializes_to_snake_case_string() {
+        let gap = GapMarker {
+            reason: GapReason::VerifyMismatch,
+            ticker: Ticker("KXTEST".to_string()),
+            channel: "orderbook".to_string(),
+            last_seq: None,
+            observed_seq: None,
+            detail: "book diverged from REST verify observation".to_string(),
+        };
+        let env = Envelope::new(ts(), None, None, RecordKind::Gap(gap));
+        let value = serde_json::to_value(&env).expect("to_value");
+        assert_eq!(value["data"]["reason"], "verify_mismatch");
+
+        let json = serde_json::to_string(&env).expect("serialize");
+        let back: Envelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(env, back);
+    }
+
+    #[test]
+    fn validate_accepts_exactly_current_version_two() {
+        let mut env = Envelope::new(ts(), None, None, RecordKind::Snapshot(sample_snapshot()));
+        env.v = 2;
+        assert_eq!(env.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_version_three() {
+        let mut env = Envelope::new(ts(), None, None, RecordKind::Snapshot(sample_snapshot()));
+        env.v = 3;
+        assert_eq!(
+            env.validate(),
+            Err(EnvelopeError::UnsupportedVersion {
+                found: 3,
+                supported: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn old_v1_line_still_deserializes_and_validates() {
+        // A line written by a build before ENVELOPE_VERSION was bumped to 2 must
+        // still be readable: v is a forward-compat guard against *newer* schemas,
+        // not a requirement that every line matches the current build exactly.
+        let line = serde_json::json!({
+            "v": 1,
+            "recv_ts": ts_value(),
+            "kind": "snapshot",
+            "data": {
+                "ticker": "KXTEST",
+                "ts": ts_value(),
+                "yes": [{ "price": 80_000, "quantity": 30_000 }],
+                "no": []
+            }
+        })
+        .to_string();
+        let env: Envelope = serde_json::from_str(&line).expect("v1 line still deserializes");
+        assert_eq!(env.validate(), Ok(()), "v1 line still validates");
     }
 }

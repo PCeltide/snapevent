@@ -29,6 +29,11 @@ pub struct Book {
     pub yes_total: i64,
     /// Running total of NO resting size (centi-contracts). See [`Book::yes_total`].
     pub no_total: i64,
+    /// Count of strictly-negative residuals seen by [`Book::apply_change`] (a
+    /// delta drove a level below zero — a consistency signal, not a legitimate
+    /// full cancel). Cumulative for the life of the `Book`; deliberately NOT
+    /// reset by [`Book::apply_snapshot_levels`] (it is a session-level diagnostic).
+    pub underflows: u64,
 }
 
 /// Insert a snapshot's price levels into `map` and accumulate their sizes into
@@ -78,10 +83,14 @@ impl Book {
         *entry += delta_centi;
         *total += delta_centi;
         let new = *entry;
+        let underflowed = new < 0;
         if new <= 0 {
             // Level pruned: drop its (<= 0) residual from the running total.
             *total -= new;
             side.remove(&price_micro);
+        }
+        if underflowed {
+            self.underflows += 1;
         }
     }
 
@@ -247,6 +256,52 @@ mod tests {
         assert_eq!(book.top().imbalance(), Some(0.5));
         let empty = Book::default();
         assert_eq!(empty.top().imbalance(), None);
+    }
+
+    #[test]
+    fn exact_zero_removal_does_not_count_as_underflow() {
+        let mut book = Book::default();
+        book.apply_snapshot(&snapshot(vec![level(410_000, 2_051)], vec![]));
+        book.apply_delta(&delta(Side::Yes, 410_000, -2_051)); // lands exactly on 0
+        assert_eq!(book.underflows, 0);
+    }
+
+    #[test]
+    fn delta_driving_a_level_below_zero_counts_as_underflow() {
+        let mut book = Book::default();
+        book.apply_snapshot(&snapshot(vec![level(410_000, 2_051)], vec![]));
+        book.apply_delta(&delta(Side::Yes, 410_000, -3_000)); // overshoots below 0
+        assert_eq!(book.underflows, 1);
+    }
+
+    #[test]
+    fn two_separate_underflows_accumulate() {
+        let mut book = Book::default();
+        book.apply_snapshot(&snapshot(
+            vec![level(410_000, 100), level(420_000, 100)],
+            vec![],
+        ));
+        book.apply_delta(&delta(Side::Yes, 410_000, -300));
+        book.apply_delta(&delta(Side::Yes, 420_000, -500));
+        assert_eq!(book.underflows, 2);
+    }
+
+    #[test]
+    fn apply_snapshot_levels_does_not_reset_underflows() {
+        let mut book = Book::default();
+        book.apply_snapshot(&snapshot(vec![level(410_000, 100)], vec![]));
+        book.apply_delta(&delta(Side::Yes, 410_000, -300)); // underflow
+        assert_eq!(book.underflows, 1);
+        book.apply_snapshot(&snapshot(vec![level(450_000, 50)], vec![]));
+        assert_eq!(
+            book.underflows, 1,
+            "snapshot is a session-level diagnostic, not reset"
+        );
+    }
+
+    #[test]
+    fn default_book_has_zero_underflows() {
+        assert_eq!(Book::default().underflows, 0);
     }
 
     #[test]

@@ -15,8 +15,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
-use kdp_core::{BookSide, MicroDollars, RestingQty, Side, Ticker, Timestamp, Trade};
+use kdp_core::{BookSide, MicroDollars, PriceLevel, RestingQty, Side, Ticker, Timestamp, Trade};
 
+use crate::auth::KalshiCredentials;
 use crate::{KalshiError, Result, KALSHI_API_BASE};
 
 /// Max total attempts (initial + retries) for a transient GET.
@@ -49,6 +50,64 @@ async fn get_with_retry(
     loop {
         attempt += 1;
         match client.get(url).query(query).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(resp);
+                }
+                if status_is_retryable(status.as_u16()) && attempt < MAX_GET_ATTEMPTS {
+                    let backoff = retry_backoff(attempt);
+                    warn!(%url, status = status.as_u16(), attempt, backoff_s = backoff.as_secs(),
+                          "retryable HTTP status; backing off");
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                // Non-retryable status, or out of attempts: surface the HTTP error.
+                resp.error_for_status()?;
+                unreachable!("error_for_status returns Err for a non-success status");
+            }
+            Err(e) => {
+                // Transport-level failure (reset/timeout/connect): retry the GET.
+                if attempt < MAX_GET_ATTEMPTS {
+                    let backoff = retry_backoff(attempt);
+                    warn!(%url, error = %e, attempt, backoff_s = backoff.as_secs(),
+                          "transient transport error; retrying GET");
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+/// Same retry/backoff skeleton as [`get_with_retry`], but for **authenticated**
+/// GETs: the three `KALSHI-ACCESS-*` headers are (re)computed from `creds` on
+/// every attempt, inside the loop, so a retry after backoff never reuses a
+/// stale timestamp (Kalshi ties the signature to `ts_ms + method + path`).
+///
+/// `sign_path` is the URL path only (no query string) — Kalshi signs
+/// `ts_ms + "GET" + path`, matching the convention the WS client uses for its
+/// upgrade request (`crate::ws::handshake::authenticated_request`, which signs
+/// the full path off the connect URL, e.g. `/trade-api/ws/v2`). A signing
+/// failure is a typed [`KalshiError`] that propagates immediately — it is not
+/// retryable.
+async fn get_with_retry_signed(
+    client: &reqwest::Client,
+    creds: &KalshiCredentials,
+    url: &str,
+    sign_path: &str,
+    query: &[(&str, String)],
+) -> Result<reqwest::Response> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let headers = creds.signed_headers("GET", sign_path)?;
+        let mut req = client.get(url).query(query);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -133,6 +192,9 @@ pub struct Market {
     /// Last trade price as a fixed-point dollar string, when present.
     #[serde(default)]
     pub last_price_dollars: Option<String>,
+    /// 24h traded volume as a fixed-point string, when present.
+    #[serde(default)]
+    pub volume_24h_fp: Option<String>,
 }
 
 impl Market {
@@ -140,6 +202,15 @@ impl Market {
     /// convenience only — not used for money math.
     pub fn volume(&self) -> f64 {
         self.volume_fp
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// 24h volume parsed to `f64` for ranking (0.0 if absent/unparseable).
+    /// Display convenience only — not used for money math.
+    pub fn volume_24h(&self) -> f64 {
+        self.volume_24h_fp
             .as_deref()
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0)
@@ -319,13 +390,106 @@ pub async fn discover_markets(
         }
     }
 
-    found.sort_by(|a, b| {
-        b.volume()
-            .partial_cmp(&a.volume())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // total_cmp: a total order even if the venue ever emitted "NaN"/"inf"
+    // (which parse::<f64> accepts) -- partial_cmp-to-Equal would hand sort_by
+    // a non-total comparator, which panics on detection in current Rust.
+    found.sort_by(|a, b| b.volume().total_cmp(&a.volume()));
     info!(matches = found.len(), %query, ?series, ?status, "discover complete");
     Ok(found)
+}
+
+/// A series template row from `GET /series` (tolerant; unknown fields ignored).
+/// `volume_fp` is present only when the request sets `include_volume=true`.
+#[derive(Debug, Deserialize)]
+pub struct Series {
+    /// Series ticker (e.g. `"KXBTCD"`).
+    pub ticker: String,
+    /// Human-readable series title.
+    pub title: String,
+    /// Series category (e.g. `"Crypto"`).
+    pub category: String,
+    /// Human-readable cadence (e.g. `"hourly"`, `"weekly"`, `"one-off"`).
+    pub frequency: String,
+    /// Series tags, when present.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    /// Total contracts traded across all events in the series, fixed-point
+    /// string, present only with `include_volume=true`.
+    #[serde(default)]
+    pub volume_fp: Option<String>,
+}
+
+impl Series {
+    /// Volume parsed to `f64` for ranking (0.0 if absent/unparseable). Display
+    /// convenience only — not used for money math.
+    pub fn volume(&self) -> f64 {
+        self.volume_fp
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    }
+}
+
+/// Envelope returned by `GET /series`.
+#[derive(Debug, Deserialize)]
+struct SeriesListResponse {
+    series: Vec<Series>,
+}
+
+/// Build the `/series` query params. Pure (no I/O) so the filter wiring is
+/// unit-tested without a live server. `include_volume` is always requested
+/// (the ranking needs it); `category` is added only when given.
+fn series_query(category: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut query: Vec<(&'static str, String)> = vec![("include_volume", "true".to_string())];
+    if let Some(c) = category {
+        query.push(("category", c.to_string()));
+    }
+    query
+}
+
+/// Fetch the full series template list from the public, **unauthenticated**
+/// `GET /series` endpoint, optionally narrowed server-side to `category`.
+/// Unlike `/markets` this endpoint is **unpaginated** — the spec defines no
+/// cursor, so one request returns the whole list.
+#[instrument(skip(client))]
+pub async fn get_series_list(
+    client: &reqwest::Client,
+    category: Option<&str>,
+) -> Result<Vec<Series>> {
+    let url = format!("{KALSHI_API_BASE}/series");
+    let query = series_query(category);
+
+    let resp = get_with_retry(client, &url, &query).await?;
+    let body: SeriesListResponse = resp
+        .json()
+        .await
+        .map_err(|e| KalshiError::Decode(format!("series list: {e}")))?;
+    info!(count = body.series.len(), ?category, "received series list");
+    Ok(body.series)
+}
+
+/// Envelope returned by `GET /series/{series_ticker}`.
+#[derive(Debug, Deserialize)]
+struct SeriesResponse {
+    series: Series,
+}
+
+/// Fetch one series template by ticker from the public, **unauthenticated**
+/// `GET /series/{series_ticker}` endpoint, with `include_volume=true` so the
+/// ranking/summary field is populated. A ticker the venue doesn't know is a
+/// plain HTTP error (404) surfaced through the retry path's typed error —
+/// authoritative, unlike scanning the (possibly non-exhaustive) full list.
+#[instrument(skip(client))]
+pub async fn get_series(client: &reqwest::Client, ticker: &str) -> Result<Series> {
+    let url = format!("{KALSHI_API_BASE}/series/{ticker}");
+    let query = series_query(None);
+
+    let resp = get_with_retry(client, &url, &query).await?;
+    let body: SeriesResponse = resp
+        .json()
+        .await
+        .map_err(|e| KalshiError::Decode(format!("series {ticker}: {e}")))?;
+    Ok(body.series)
 }
 
 /// A trade as returned by `GET /markets/trades` (raw fixed-point strings).
@@ -491,6 +655,160 @@ pub async fn get_cutoff(client: &reqwest::Client) -> Result<Cutoff> {
     Ok(cutoff)
 }
 
+/// Max tickers per `GET /markets/orderbooks` request (openapi.yaml: `tickers`
+/// query param, `maxItems: 100`).
+const ORDERBOOK_CHUNK_SIZE: usize = 100;
+
+/// Outcome of decoding one book from the batch orderbook response.
+///
+/// Shape pinned from `docs/kalshi/openapi.yaml`: `GetMarketOrderbooksResponse`
+/// (`orderbooks: [MarketOrderbookFp]`), `MarketOrderbookFp` (`ticker`,
+/// `orderbook_fp`), `OrderbookCountFp` (`yes_dollars`/`no_dollars`: arrays of
+/// `PriceLevelDollarsCountFp`, a 2-string array `[price_dollars, count_fp]`,
+/// e.g. `["0.1500","100.00"]`). The endpoint returns **bids only** on both
+/// sides (no asks) — a yes bid at X is equivalent to a no ask at 100-X.
+///
+/// A bad level or a missing field never aborts the sweep and never silently
+/// drops a market: it becomes [`RestOrderbookOutcome::Undecodable`], which the
+/// caller is expected to persist as a `RawFallback` record rather than drop.
+#[derive(Debug)]
+pub enum RestOrderbookOutcome {
+    /// Successfully decoded book for one ticker.
+    Book {
+        /// Market ticker.
+        ticker: String,
+        /// Yes-side bid levels as returned (best-to-worst).
+        yes: Vec<PriceLevel>,
+        /// No-side bid levels as returned (best-to-worst).
+        no: Vec<PriceLevel>,
+    },
+    /// A per-book decode failure: bad level string, missing `orderbook_fp`, etc.
+    Undecodable {
+        /// Ticker, if it could be read from the payload before the failure.
+        ticker: Option<String>,
+        /// Human-readable decode error.
+        error: String,
+        /// The raw per-book JSON, preserved so it can be persisted verbatim.
+        payload: serde_json::Value,
+    },
+}
+
+/// Wire shape of `OrderbookCountFp`: two arrays of `[price_dollars, count_fp]`.
+#[derive(Debug, Deserialize)]
+struct OrderbookCountFpWire {
+    #[serde(default)]
+    yes_dollars: Vec<[String; 2]>,
+    #[serde(default)]
+    no_dollars: Vec<[String; 2]>,
+}
+
+/// Decode one `[price_dollars, count_fp]` pair into a lossless [`PriceLevel`]
+/// via the same integer string surgery the WS decode path uses
+/// (`MicroDollars::parse` for the price, `RestingQty::parse` for the count).
+fn decode_level(raw: &[String; 2]) -> std::result::Result<PriceLevel, String> {
+    let [price_s, count_s] = raw;
+    let price = MicroDollars::parse(price_s).map_err(|e| format!("price {price_s:?}: {e}"))?;
+    let quantity = RestingQty::parse(count_s).map_err(|e| format!("count {count_s:?}: {e}"))?;
+    Ok(PriceLevel { price, quantity })
+}
+
+fn decode_levels(raw: &[[String; 2]]) -> std::result::Result<Vec<PriceLevel>, String> {
+    raw.iter().map(decode_level).collect()
+}
+
+/// Decode one raw `MarketOrderbookFp` JSON value into a [`RestOrderbookOutcome`].
+/// `ticker` is threaded in separately (read before this is called) so it can be
+/// attached to an `Undecodable` outcome even when the rest of the book fails.
+fn decode_book(raw: &serde_json::Value, ticker: Option<String>) -> RestOrderbookOutcome {
+    let result = (|| -> std::result::Result<RestOrderbookOutcome, String> {
+        let ticker = ticker.clone().ok_or("missing ticker")?;
+        let orderbook_fp = raw.get("orderbook_fp").ok_or("missing orderbook_fp")?;
+        let wire: OrderbookCountFpWire = serde_json::from_value(orderbook_fp.clone())
+            .map_err(|e| format!("orderbook_fp: {e}"))?;
+        let yes = decode_levels(&wire.yes_dollars)?;
+        let no = decode_levels(&wire.no_dollars)?;
+        Ok(RestOrderbookOutcome::Book { ticker, yes, no })
+    })();
+
+    match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            warn!(?ticker, %error, "undecodable orderbook entry");
+            RestOrderbookOutcome::Undecodable {
+                ticker,
+                error,
+                payload: raw.clone(),
+            }
+        }
+    }
+}
+
+/// Decode a full `GET /markets/orderbooks` response body into one outcome per
+/// requested ticker. Pure (no I/O) so fixture responses are unit-tested
+/// without a live server or a mock HTTP server.
+fn decode_orderbooks_response(body: &serde_json::Value) -> Vec<RestOrderbookOutcome> {
+    body.get("orderbooks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|raw| {
+            let ticker = raw
+                .get("ticker")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            decode_book(raw, ticker)
+        })
+        .collect()
+}
+
+/// Split `tickers` into request-sized chunks (`/markets/orderbooks` caps
+/// `tickers` at [`ORDERBOOK_CHUNK_SIZE`] per call). Pure so the chunking policy
+/// is unit-tested without a live server.
+fn chunk_tickers(tickers: &[String], size: usize) -> Vec<&[String]> {
+    tickers.chunks(size.max(1)).collect()
+}
+
+/// Fetch order books for up to 100 tickers per request (`GET
+/// /markets/orderbooks`, authenticated). Empty `tickers` returns immediately
+/// with no network call. Larger inputs are chunked at [`ORDERBOOK_CHUNK_SIZE`]
+/// and fetched sequentially; a whole-request failure (after retries) propagates
+/// as `Err` — the caller is expected to warn and skip that sweep. A per-book
+/// decode problem does not fail the request: it surfaces as
+/// [`RestOrderbookOutcome::Undecodable`] alongside the successfully decoded
+/// books in the same response.
+#[instrument(skip(client, creds))]
+pub async fn get_orderbooks(
+    client: &reqwest::Client,
+    creds: &KalshiCredentials,
+    tickers: &[String],
+) -> Result<Vec<RestOrderbookOutcome>> {
+    if tickers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let url = format!("{KALSHI_API_BASE}/markets/orderbooks");
+    let sign_path = reqwest::Url::parse(&url)
+        .map(|u| u.path().to_string())
+        .map_err(|e| KalshiError::Decode(format!("orderbooks url {url:?}: {e}")))?;
+
+    let mut outcomes = Vec::with_capacity(tickers.len());
+    for chunk in chunk_tickers(tickers, ORDERBOOK_CHUNK_SIZE) {
+        let query: Vec<(&str, String)> = chunk.iter().map(|t| ("tickers", t.clone())).collect();
+        let resp = get_with_retry_signed(client, creds, &url, &sign_path, &query).await?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| KalshiError::Decode(format!("orderbooks body: {e}")))?;
+        outcomes.extend(decode_orderbooks_response(&body));
+    }
+    info!(
+        tickers = tickers.len(),
+        books = outcomes.len(),
+        "orderbooks sweep complete"
+    );
+    Ok(outcomes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,6 +857,116 @@ mod tests {
             markets_query(500, None, None, None, None, None),
             vec![("limit", "500".to_string())]
         );
+    }
+
+    #[test]
+    fn series_query_includes_category_only_when_present() {
+        let q = series_query(Some("Crypto"));
+        assert!(q.contains(&("include_volume", "true".to_string())));
+        assert!(q.contains(&("category", "Crypto".to_string())));
+
+        let q_none = series_query(None);
+        assert_eq!(q_none, vec![("include_volume", "true".to_string())]);
+    }
+
+    #[test]
+    fn series_list_fixture_decodes_tolerantly() {
+        let json = r#"{
+            "series": [
+                {
+                    "ticker": "KXBTCD",
+                    "title": "Bitcoin price",
+                    "category": "Crypto",
+                    "frequency": "hourly",
+                    "tags": ["btc", "crypto"],
+                    "volume_fp": "1234.00"
+                },
+                {
+                    "ticker": "KXETHD",
+                    "title": "Ethereum price",
+                    "category": "Crypto",
+                    "frequency": "hourly",
+                    "tags": ["eth"],
+                    "volume_fp": "500.00"
+                },
+                {
+                    "ticker": "KXIPLGAME",
+                    "title": "IPL game winner",
+                    "category": "Sports",
+                    "frequency": "one-off",
+                    "fee_type": "quadratic"
+                }
+            ]
+        }"#;
+        let body: SeriesListResponse = serde_json::from_str(json).expect("decode");
+        assert_eq!(body.series.len(), 3);
+
+        assert_eq!(body.series[0].volume(), 1234.0);
+        assert_eq!(body.series[1].volume(), 500.0);
+
+        let sports = &body.series[2];
+        assert_eq!(sports.category, "Sports");
+        assert!(sports.tags.is_none());
+        assert!(sports.volume_fp.is_none());
+        assert_eq!(sports.volume(), 0.0, "absent volume_fp defaults to 0.0");
+    }
+
+    #[test]
+    fn single_series_response_decodes() {
+        let json = r#"{
+            "series": {
+                "ticker": "KXBTCD",
+                "title": "Bitcoin price",
+                "category": "Crypto",
+                "frequency": "hourly",
+                "tags": ["btc"],
+                "volume_fp": "42.00"
+            }
+        }"#;
+        let body: SeriesResponse = serde_json::from_str(json).expect("decode");
+        assert_eq!(body.series.ticker, "KXBTCD");
+        assert_eq!(body.series.volume(), 42.0);
+    }
+
+    #[test]
+    fn market_volume_24h_parses_and_defaults() {
+        let json = r#"{
+            "ticker": "KXBTCD-A",
+            "title": "Bitcoin at close",
+            "status": "open",
+            "volume_fp": "100.00",
+            "volume_24h_fp": "42.50"
+        }"#;
+        let m: Market = serde_json::from_str(json).expect("decode");
+        assert_eq!(m.volume_24h(), 42.5);
+
+        // Existing-shape fixture without volume_24h_fp still decodes.
+        let json_old = r#"{
+            "ticker": "KXIPLGAME-26MAY291000RRGT-RR",
+            "event_ticker": "KXIPLGAME-26MAY291000RRGT",
+            "open_time": "2026-05-27T18:24:00Z",
+            "close_time": "2026-05-29T17:56:19Z",
+            "settlement_ts": "2026-05-29T18:01:19Z",
+            "occurrence_datetime": "2026-05-29T18:00:00Z",
+            "status": "finalized",
+            "result": "no"
+        }"#;
+        let m_old: Market = serde_json::from_str(json_old).expect("decode");
+        assert_eq!(m_old.volume_24h(), 0.0);
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the live Kalshi API"]
+    async fn live_get_series_list_probe() {
+        let client = reqwest::Client::new();
+        let series = get_series_list(&client, None)
+            .await
+            .expect("fetch series list");
+        assert!(!series.is_empty(), "expected at least one series");
+        for s in &series {
+            assert!(!s.ticker.is_empty(), "ticker must not be empty");
+            assert!(!s.category.is_empty(), "category must not be empty");
+        }
     }
 
     #[test]
@@ -621,5 +1049,232 @@ mod tests {
         // Round-trips (Serialize) so it can be persisted alongside the trades.
         let round = serde_json::to_string(&m).expect("serialize");
         assert!(round.contains(r#""settlement_ts":"2026-05-29T18:01:19Z""#));
+    }
+
+    // A throwaway PKCS#8 test key (not a credential) — same one used in auth.rs
+    // tests. Only needed to construct a `KalshiCredentials` value; the empty-
+    // tickers test never signs anything (no network call is made).
+    const TEST_KEY_PKCS8: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCs9d6u5OrN4b4b
+zASLghdDeKjmbwLmLWeLPmuc/hP2OT6uvrWxBJQeuGb5uNYOBmQH1LtvVh84qUct
+JpZmUNUSRXiKH3rbyQeJBO5SDx0Qn6pXgv4rJPc20PlItfzPAA9VtEN7oWznbhTG
+lL/3SzEBjC6BujtVo4goOi6wu0XaXmjje4hxx4mDblygSktZ0GF32CJw4Hos53Ro
+vozyGeM76ClpjxjZO7oPn6Ogqg3KU3HQWzv93/RqU8b79g+6T1P3ehjCL6WAOPvB
+hobJx8uh1raRJfGnMMRubsJ/epLPfPoxRdAVntkFq6srhtsZZu62E6ktgTPpZ0w8
+9zNP9rtBAgMBAAECggEAEnvniOxY9Zi0REHjkx8w1O/uU6C11XCGb3iZGpAtWkkt
+huebAOh62zpHcv+gYfj9NA21hu/+v9juDN1iAbGOG85F1AkKNwvUXNMklFYeJo/R
+rgQx8ogYTV48OIY5FswsV13qP6pK5QQRf1QX8dncymFh+lDd6h3jErLTw4+3/DP2
+c4TwxmPODmOfnTyNxKXJsqcPbGa7HBN6f7ugNCx+KctuJAlR4PyKy4JkVTBpJP7v
+RH1J+LwudLbbL7N/LpSlhK3gRfT4X4pBkam2lGPgtkr9eBfJyo5SEULwBviE3ce9
+4FIsYi/aRR+NPiUjAjLXpAXwgif+pcFj0EwV6qgH4wKBgQDsJU2CYPiaL0W6NzQ+
+irCT4CDs5UYzGnvC+iYC0PWVhVtQ68W+tTxnlnC6fAjhC1qx/fNOxEbBDnGCXHTc
+y2GgICMCu32NhyL/Sq6l6huf0lmuuX126sH1avKgGkLTOMVCKyLINlPWHn2lYsap
+ySB7tgdc7e+tgjaB2p/HspOK4wKBgQC7gJg4GspAjqJpUoJuTwcbKCtqXp7YnVMz
+bntM/guWrW7rI8+CDkU6h8KrYvJqmCnSd0TgElra7sQ4aB3Tdtt4z5hbPgs8j4Is
+pFbnazJqJhbu1pUncOttGgAZSQXTOvONyujYeevVQd7O8yq/HuyOkJsfD6lgOmnq
++y3GP1MGiwKBgQDVPH34LG5wdB1noK/Jhd0bOvkgUYyJWvHEx7OJOX15rfkeYjin
+E+res0dJ7fTqmiEktud9CdnGPK+dArX4JqMaP8q9jeY65XthweNhKLwXHpAjKZY0
+ypmobhF3Jx+OsiXVsTPwTLZ5lADrVf2ElXyCmYWekbCrIfjsWymK3yNB9wKBgFOa
+xUTO/TvH3bckqS/SYRLE2Ib3ZdCkZcLbEnOEG1q2PmzubMpK3qd4fV66IelRq+RC
+dh2LUaOpLykPk60EpFu8BO06Pvxj6OFK7c0GSVZ3YWZhm+QYP4FIRJ8Bpm1HLe4d
+ebF8u6E9W8HfP0I04bm31NMGwrk7kprKIODyv2x9AoGBAMkBEToLzyqGs7StzyPH
+CYC2s34wvDedWFmHmjL0pXaM4THHranHWpn+Hp3pxu2Xzc4C92TAwrrIW8bKZ8w1
+G44t8znFg+RVrK6kKvil2bM1ISpG+EtC1j9O8I0W5M0ozDKTckZwbF3VFEUvYiaw
+FSCdm2zv/hgDDD5k5SdmeEfR
+-----END PRIVATE KEY-----
+";
+
+    fn test_creds() -> KalshiCredentials {
+        KalshiCredentials::from_pem("kid", TEST_KEY_PKCS8).expect("load test key")
+    }
+
+    #[test]
+    fn decode_orderbooks_response_parses_two_tickers() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{
+                "orderbooks": [
+                    {
+                        "ticker": "KXBTCD-A",
+                        "orderbook_fp": {
+                            "yes_dollars": [["0.1500", "100.00"]],
+                            "no_dollars": [["0.4000", "50.00"]]
+                        }
+                    },
+                    {
+                        "ticker": "KXBTCD-B",
+                        "orderbook_fp": {
+                            "yes_dollars": [],
+                            "no_dollars": []
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("fixture parses");
+
+        let outcomes = decode_orderbooks_response(&body);
+        assert_eq!(outcomes.len(), 2);
+
+        match &outcomes[0] {
+            RestOrderbookOutcome::Book { ticker, yes, no } => {
+                assert_eq!(ticker, "KXBTCD-A");
+                assert_eq!(
+                    yes,
+                    &[PriceLevel {
+                        price: MicroDollars(150_000),
+                        quantity: RestingQty(10_000),
+                    }]
+                );
+                assert_eq!(
+                    no,
+                    &[PriceLevel {
+                        price: MicroDollars(400_000),
+                        quantity: RestingQty(5_000),
+                    }]
+                );
+            }
+            other => panic!("expected Book, got {other:?}"),
+        }
+
+        match &outcomes[1] {
+            RestOrderbookOutcome::Book { ticker, yes, no } => {
+                assert_eq!(ticker, "KXBTCD-B");
+                assert!(yes.is_empty());
+                assert!(no.is_empty());
+            }
+            other => panic!("expected Book, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_orderbooks_response_reports_malformed_level_string() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{
+                "orderbooks": [
+                    {
+                        "ticker": "KXBTCD-BAD",
+                        "orderbook_fp": {
+                            "yes_dollars": [["abc", "100.00"]],
+                            "no_dollars": []
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("fixture parses");
+
+        let outcomes = decode_orderbooks_response(&body);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            RestOrderbookOutcome::Undecodable {
+                ticker,
+                error,
+                payload,
+            } => {
+                assert_eq!(ticker.as_deref(), Some("KXBTCD-BAD"));
+                assert!(
+                    error.contains("abc"),
+                    "error should name the bad string: {error}"
+                );
+                assert_eq!(payload["ticker"], "KXBTCD-BAD");
+            }
+            other => panic!("expected Undecodable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_orderbooks_response_reports_missing_orderbook_fp() {
+        let body: serde_json::Value =
+            serde_json::from_str(r#"{"orderbooks": [{"ticker": "KXBTCD-NOFP"}]}"#)
+                .expect("fixture parses");
+
+        let outcomes = decode_orderbooks_response(&body);
+        assert_eq!(outcomes.len(), 1);
+        match &outcomes[0] {
+            RestOrderbookOutcome::Undecodable { ticker, error, .. } => {
+                assert_eq!(ticker.as_deref(), Some("KXBTCD-NOFP"));
+                assert!(error.contains("orderbook_fp"), "error: {error}");
+            }
+            other => panic!("expected Undecodable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunk_tickers_splits_at_the_request_cap() {
+        let tickers: Vec<String> = (0..250).map(|i| format!("T{i}")).collect();
+        let chunks = chunk_tickers(&tickers, 100);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 100);
+        assert_eq!(chunks[1].len(), 100);
+        assert_eq!(chunks[2].len(), 50);
+
+        let empty: Vec<String> = Vec::new();
+        assert!(chunk_tickers(&empty, 100).is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_orderbooks_with_empty_tickers_makes_no_request() {
+        let client = reqwest::Client::new();
+        let creds = test_creds();
+        let outcomes = get_orderbooks(&client, &creds, &[])
+            .await
+            .expect("empty ticker list never errors");
+        assert!(outcomes.is_empty());
+    }
+
+    /// One-time live probe (never run in CI). Reads real credentials from the
+    /// environment, finds 1-2 open KXBTCD markets via the public
+    /// `list_markets_page`, and asserts the authenticated batch orderbook fetch
+    /// succeeds.
+    ///
+    /// Signing-path convention confirmed live: the path signed is the request's
+    /// **full URL path including the `/trade-api/v2` prefix**
+    /// (`/trade-api/v2/markets/orderbooks`), the same convention the WS client
+    /// uses for its upgrade request (full path off the connect URL, e.g.
+    /// `/trade-api/ws/v2`) — not the bare endpoint path (`/markets/orderbooks`).
+    ///
+    /// Run from the repo root with the env loaded from `.env`. Cargo runs test
+    /// binaries with cwd = the crate directory, not the repo root, so the key
+    /// path must be absolute:
+    /// ```text
+    /// export PATH="$HOME/.cargo/bin:$PATH" && set -a && source .env && set +a \
+    ///   && export KDP_KALSHI_PRIVATE_KEY_PATH="$(pwd)/snapeventing.txt" \
+    ///   && cargo test -p kdp-kalshi live_get_orderbooks_probe -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hits the live Kalshi API; requires real credentials in the environment"]
+    async fn live_get_orderbooks_probe() {
+        let creds = KalshiCredentials::from_env()
+            .expect("set KALSHI_API_KEY_ID + KDP_KALSHI_PRIVATE_KEY_PATH to run this probe");
+        let client = reqwest::Client::new();
+
+        let (markets, _) =
+            list_markets_page(&client, 50, Some("open"), Some("KXBTCD"), None, None, None)
+                .await
+                .expect("list open KXBTCD markets");
+        let tickers: Vec<String> = markets
+            .iter()
+            .take(2)
+            .map(|m| m.ticker.as_str().to_string())
+            .collect();
+        assert!(
+            !tickers.is_empty(),
+            "need at least one open KXBTCD market to probe"
+        );
+
+        let outcomes = get_orderbooks(&client, &creds, &tickers)
+            .await
+            .expect("authenticated batch orderbook fetch");
+        assert!(!outcomes.is_empty());
+        for outcome in &outcomes {
+            match outcome {
+                RestOrderbookOutcome::Book { ticker, .. } => {
+                    println!("probe ok: {ticker} decoded as Book");
+                }
+                RestOrderbookOutcome::Undecodable { ticker, error, .. } => {
+                    panic!("expected Book, got Undecodable for {ticker:?}: {error}");
+                }
+            }
+        }
     }
 }

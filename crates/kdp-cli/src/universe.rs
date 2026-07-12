@@ -178,6 +178,7 @@ pub(crate) async fn run_universe(args: &crate::args::Args) -> anyhow::Result<()>
         archive_cmd: args
             .get_or("archive-cmd", "/opt/kdp/bin/kdp-archive.sh")
             .to_string(),
+        verify_interval_secs: crate::capture::parse_verify_interval(args)?,
     };
     let remote_prefix = format!("universe-{name}");
 
@@ -245,7 +246,7 @@ pub(crate) async fn run_universe(args: &crate::args::Args) -> anyhow::Result<()>
             inflight.push((
                 session,
                 tokio::spawn(async move {
-                    run_capture_unit(&creds2, &client2, &unit, &cfg2, srx).await;
+                    run_capture_unit(creds2, &client2, &unit, &cfg2, srx).await;
                 }),
             ));
         }

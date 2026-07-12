@@ -42,6 +42,8 @@ pub struct Counts {
     pub gaps: usize,
     /// Rows in `raw` (undecodable messages preserved verbatim).
     pub raw: usize,
+    /// Rows in `verify` -- one per REST verify observation.
+    pub verify: usize,
 }
 
 /// The provenance + safety record written next to a ticker's output tables.
@@ -92,6 +94,18 @@ pub struct Manifest {
     /// How many orderbook messages showed a two-sided top-of-book (diagnostic).
     #[serde(default)]
     pub two_sided_snapshots: usize,
+    /// Total REST verify observations resolved (rows in `verify`).
+    pub verify_checks: usize,
+    /// Of `verify_checks`, how many proved the replayed book diverged from the
+    /// venue's REST orderbook (`outcome == "mismatch"`).
+    pub verify_mismatches: usize,
+    /// Of `verify_checks`, how many could render no honest verdict
+    /// (`"skipped_gap"` + `"truncated"`).
+    pub verify_skipped: usize,
+    /// Cumulative [`kdp_core::Book::underflows`] after replay: deltas that drove
+    /// a level strictly below zero (a consistency signal, distinct from
+    /// verification).
+    pub underflows: u64,
 }
 
 impl Manifest {
@@ -137,12 +151,17 @@ mod tests {
                 trades: 5,
                 gaps: 0,
                 raw: 0,
+                verify: 0,
             },
             read_errors: 0,
             complete: true,
             notes: vec!["safe".into()],
             two_sided: false,
             two_sided_snapshots: 0,
+            verify_checks: 0,
+            verify_mismatches: 0,
+            verify_skipped: 0,
+            underflows: 0,
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: serde_json::Value = serde_json::from_str(&json).unwrap();

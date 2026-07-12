@@ -145,6 +145,9 @@ _COVERAGE_SCHEMA = {
     "n_unresolved_gaps": pl.Int64,
     "hole_us": pl.Int64,
     "uptime": pl.Float64,
+    "verify_checks": pl.Int64,
+    "verify_mismatches": pl.Int64,
+    "underflows": pl.Int64,
     "n_book_events": pl.Int64,
     "n_trades": pl.Int64,
 }
@@ -185,6 +188,9 @@ def _entry_row(entry: Entry) -> dict:
         "n_unresolved_gaps": (None if gaps is None else sum(1 for _, _, r in windows if not r)),
         "hole_us": hole_us,
         "uptime": uptime,
+        "verify_checks": entry.verify_checks,
+        "verify_mismatches": entry.verify_mismatches,
+        "underflows": entry.underflows,
         "n_book_events": entry.tables.get("book_events", 0),
         "n_trades": entry.tables.get("trades", 0),
     }

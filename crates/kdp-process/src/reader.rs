@@ -120,7 +120,8 @@ mod tests {
 
     #[test]
     fn future_schema_version_is_a_loud_read_error() {
-        let future = SNAP.replacen("\"v\":1", "\"v\":2", 1);
+        let future_v = kdp_core::ENVELOPE_VERSION + 1;
+        let future = SNAP.replacen("\"v\":1", &format!("\"v\":{future_v}"), 1);
         let out = parse_all(&future);
         assert_eq!(out.len(), 1);
         let err = out[0].as_ref().unwrap_err();

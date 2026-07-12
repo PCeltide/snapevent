@@ -211,17 +211,18 @@ async fn await_full_ladder(
 /// `band`/`listing_grace`/`open_settle` are the hourly adapter's own knobs.
 #[derive(Clone)]
 pub struct HourCfg {
-    pub data_dir: String,    // session dir = data_dir/<event_ticker>
-    pub band: usize,         // strikes each side of ATM
-    pub floor_bytes: u64,    // disk guard floor
-    pub capacity: usize,     // channel buffer
-    pub idle_secs: u64,      // WS idle timeout
-    pub grace_secs: u64,     // keep capturing this long after settlement
-    pub poll_secs: u64,      // settlement poll interval
-    pub max_hours: u64,      // hard backstop per hour
-    pub listing_grace: u64,  // keep retrying discovery this long past the boundary (s)
-    pub open_settle: u64,    // wait this long past open for the full ladder before selecting (s)
+    pub data_dir: String,          // session dir = data_dir/<event_ticker>
+    pub band: usize,               // strikes each side of ATM
+    pub floor_bytes: u64,          // disk guard floor
+    pub capacity: usize,           // channel buffer
+    pub idle_secs: u64,            // WS idle timeout
+    pub grace_secs: u64,           // keep capturing this long after settlement
+    pub poll_secs: u64,            // settlement poll interval
+    pub max_hours: u64,            // hard backstop per hour
+    pub listing_grace: u64,        // keep retrying discovery this long past the boundary (s)
+    pub open_settle: u64, // wait this long past open for the full ladder before selecting (s)
     pub archive_cmd: String, // path to kdp-archive.sh (empty = skip, for dev)
+    pub verify_interval_secs: u64, // periodic REST verify-sweep interval (s); 0 disables
 }
 
 impl HourCfg {
@@ -237,6 +238,7 @@ impl HourCfg {
             poll_secs: self.poll_secs,
             max_secs: self.max_hours.saturating_mul(3600),
             archive_cmd: self.archive_cmd.clone(),
+            verify_interval_secs: self.verify_interval_secs,
         }
     }
 }
@@ -246,7 +248,7 @@ impl HourCfg {
 /// hourly product shares the KXBTCD Drive default (no per-event-set prefix), so
 /// `remote_prefix` is `None`.
 async fn run_one_hour(
-    creds: &KalshiCredentials,
+    creds: Arc<KalshiCredentials>,
     client: &reqwest::Client,
     series: &str,
     event_ticker: &str,
@@ -380,6 +382,7 @@ pub async fn run_hourly(args: &crate::args::Args) -> anyhow::Result<()> {
         archive_cmd: args
             .get_or("archive-cmd", "/opt/kdp/bin/kdp-archive.sh")
             .to_string(),
+        verify_interval_secs: crate::capture::parse_verify_interval(args)?,
     };
     let pre_arm = Duration::from_secs(args.get_or("pre-arm", "30").parse().unwrap_or(30));
     let creds = Arc::new(KalshiCredentials::from_env().context("loading Kalshi credentials")?);
@@ -480,7 +483,7 @@ pub async fn run_hourly(args: &crate::args::Args) -> anyhow::Result<()> {
         let ev = event_ticker.clone();
         let srx = shutdown_rx.clone();
         inflight.push(tokio::spawn(async move {
-            run_one_hour(&creds2, &client2, &series2, &ev, tickers, &cfg2, srx).await;
+            run_one_hour(creds2, &client2, &series2, &ev, tickers, &cfg2, srx).await;
         }));
         if wait_past_or_shutdown(boundary, &shutdown_rx).await {
             break;
@@ -516,6 +519,7 @@ mod schedule_tests {
             yes_bid_dollars: None,
             yes_ask_dollars: None,
             last_price_dollars: None,
+            volume_24h_fp: None,
         }
     }
 

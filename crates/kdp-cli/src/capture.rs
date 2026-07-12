@@ -13,14 +13,17 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::{error, info, instrument, warn};
 
-use kdp_core::{Envelope, RecordKind};
+use kdp_core::{Envelope, OrderbookSnapshot, RawFallback, RecordKind, Ticker, Timestamp};
 use kdp_kalshi::auth::KalshiCredentials;
+use kdp_kalshi::rest::{get_orderbooks, RestOrderbookOutcome};
 use kdp_kalshi::ws::protocol::FrameOutcome;
 use kdp_kalshi::ws::session::{run_session, CaptureEvent};
 use kdp_store::{is_safe_segment, DiskGuard, StreamSet};
@@ -61,6 +64,10 @@ pub struct CaptureReport {
     /// How many written records were inline gap markers (seq jumps + reconnects).
     /// Included in `per_stream` (and thus `total_written()`); reported separately.
     pub gaps: u64,
+    /// How many written records came from the periodic REST verify sweep
+    /// (`RecordKind::Verify` snapshots, or their raw fallbacks). Included in
+    /// `per_stream` (and thus `total_written()`); reported separately.
+    pub verify: u64,
     /// Control frames observed (not persisted).
     pub control: u64,
     /// Server error frames observed.
@@ -153,6 +160,137 @@ fn classify(event: CaptureEvent, report: &mut CaptureReport) -> Option<WriteActi
     }
 }
 
+/// One periodic REST verify-sweep result ready to append: the resolved stream
+/// ticker plus the envelope to persist under its `orderbook` channel.
+#[derive(Debug)]
+struct VerifyWrite {
+    ticker: String,
+    env: Envelope,
+}
+
+/// Convert one REST orderbook-sweep outcome into its on-disk `(ticker,
+/// Envelope)`. A decoded book becomes a [`RecordKind::Verify`] snapshot
+/// (offline cross-verification only — never a replay re-anchor, see that
+/// variant's doc); an undecodable book is preserved as a [`RecordKind::Raw`]
+/// fallback, never dropped. No I/O, no logging (the sweep caller warns on the
+/// undecodable case) — pure so it's unit-tested without a live server.
+///
+/// The resolved ticker is quarantined via [`safe_ticker`] exactly like the WS
+/// path, since it also comes from server-controlled data.
+fn verify_envelope(outcome: RestOrderbookOutcome, now: Timestamp) -> (String, Envelope) {
+    match outcome {
+        RestOrderbookOutcome::Book { ticker, yes, no } => {
+            let ticker = safe_ticker(ticker);
+            let snapshot = OrderbookSnapshot {
+                ticker: Ticker(ticker.clone()),
+                ts: now,
+                yes,
+                no,
+            };
+            (
+                ticker,
+                Envelope::new(now, None, None, RecordKind::Verify(snapshot)),
+            )
+        }
+        RestOrderbookOutcome::Undecodable {
+            ticker,
+            error,
+            payload,
+        } => {
+            let resolved = safe_ticker(
+                ticker
+                    .clone()
+                    .unwrap_or_else(|| UNROUTED_TICKER.to_string()),
+            );
+            let fallback = RawFallback {
+                raw_type: Some("rest_orderbook".to_string()),
+                ticker: ticker.map(Ticker),
+                error,
+                payload,
+            };
+            (
+                resolved,
+                Envelope::new(now, None, None, RecordKind::Raw(fallback)),
+            )
+        }
+    }
+}
+
+/// Max tickers per verify-sweep REST call, chunked HERE rather than left to
+/// `get_orderbooks`'s own internal chunking. Mirrors
+/// `kdp_kalshi::rest::ORDERBOOK_CHUNK_SIZE` (private to that crate; a call
+/// with <= this many tickers makes `get_orderbooks`'s internal chunking a
+/// no-op pass-through). Chunking here — not just there — is load-bearing: see
+/// `verify_sweep`'s per-chunk stamping comment.
+const VERIFY_SWEEP_CHUNK_SIZE: usize = 100;
+
+/// Periodic REST orderbook cross-verification sweep (2026-07-11
+/// external-methodology-review adoptable, open-items item 1): our per-`sid`
+/// seq tracking is exact for transport loss but can't catch a venue-side
+/// emission bug or a decode/replay bug on our own side. Polling `GET
+/// /markets/orderbooks` every `interval` and persisting each result alongside
+/// the WS stream gives an independent, offline-diffable cross-check.
+///
+/// Runs until `verify_tx`'s receiver is dropped (the writer task's channel
+/// closes) or the caller aborts the task (session end, mirroring how
+/// `supervisor.rs` aborts its settlement watcher). A failed chunk is a
+/// `warn!` and the sweep moves on to the next chunk — never fatal to capture.
+#[instrument(skip(creds, verify_tx), fields(tickers = tickers.len()))]
+async fn verify_sweep(
+    creds: Arc<KalshiCredentials>,
+    tickers: Vec<String>,
+    interval: Duration,
+    verify_tx: mpsc::Sender<VerifyWrite>,
+) {
+    let client = match reqwest::Client::builder()
+        .user_agent(concat!("kdp-cli/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "verify sweep: could not build http client; sweep disabled");
+            return;
+        }
+    };
+    loop {
+        tokio::time::sleep(interval).await;
+        // Chunk HERE (not inside get_orderbooks) so each chunk is stamped
+        // with its OWN `Utc::now()` immediately after ITS response returns.
+        // A single sweep-wide timestamp (stamped once after fetching every
+        // chunk) would be wrong: with e.g. 188 tickers = 2 chunks, and each
+        // chunk retrying transient errors with backoff (up to ~31s), the
+        // first chunk's book could be tens of seconds stale by the time it's
+        // stamped -- a guaranteed false mismatch against an active book. A
+        // failed chunk warns and continues to the next chunk, so one bad
+        // chunk can't discard the other chunks' already-fetched results.
+        for chunk in tickers.chunks(VERIFY_SWEEP_CHUNK_SIZE) {
+            match get_orderbooks(&client, &creds, chunk).await {
+                Ok(outcomes) => {
+                    let now: Timestamp = Utc::now().into();
+                    for outcome in outcomes {
+                        if let RestOrderbookOutcome::Undecodable { ticker, error, .. } = &outcome {
+                            warn!(
+                                ticker = ?ticker,
+                                %error,
+                                "verify sweep: undecodable orderbook; persisting raw"
+                            );
+                        }
+                        let (ticker, env) = verify_envelope(outcome, now);
+                        if verify_tx.send(VerifyWrite { ticker, env }).await.is_err() {
+                            return; // writer task gone; session must be ending
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    error = %e,
+                    chunk_len = chunk.len(),
+                    "verify sweep: chunk failed; skipping this chunk"
+                ),
+            }
+        }
+    }
+}
+
 /// Parse a duration like `"300"`, `"90s"`, `"5m"`, or `"1h"` into a [`Duration`].
 fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     let s = s.trim();
@@ -175,14 +313,21 @@ fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(secs))
 }
 
-/// The writer half: drain `rx`, persist each record, periodically guard disk.
+/// The writer half: drain `rx` (the WS stream) and `verify_rx` (the periodic
+/// REST verify sweep), persist each record, periodically guard disk.
 ///
 /// Always returns the [`CaptureReport`] (so the run report prints even on a
 /// mid-capture halt). A start-of-run disk-space failure is a hard error (nothing
 /// has been captured yet); an in-flight append/disk-full error stops the loop and
 /// is recorded in `report.halt_error` rather than discarding the report.
+///
+/// The loop exits ONLY when the WS channel (`rx`) yields `None` (session over).
+/// `verify_rx` closing (verify sweep disabled, or its task ending) must NOT end
+/// the loop — `verify_open` guards that arm off once it closes so `select!`
+/// stops polling a permanently-empty channel.
 async fn writer_task(
     mut rx: mpsc::Receiver<CaptureEvent>,
+    mut verify_rx: mpsc::Receiver<VerifyWrite>,
     base_dir: String,
     floor_bytes: u64,
 ) -> anyhow::Result<CaptureReport> {
@@ -195,25 +340,45 @@ async fn writer_task(
 
     let mut report = CaptureReport::default();
     let mut writes_since_check: u64 = 0;
+    let mut verify_open = true;
 
-    while let Some(event) = rx.recv().await {
-        let Some(action) = classify(event, &mut report) else {
-            continue;
-        };
-        if action.is_raw {
-            warn!(
-                ticker = %action.ticker,
-                channel = %action.channel,
-                "persisting raw fallback record"
-            );
-        }
-        if let Err(e) = streams.append(&action.ticker, &action.channel, &action.envelope) {
-            error!(error = %e, ticker = %action.ticker, channel = %action.channel, "append failed; halting capture");
-            report.halt_error = Some(e.to_string());
-            break;
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else { break; };
+                let Some(action) = classify(event, &mut report) else {
+                    continue;
+                };
+                if action.is_raw {
+                    warn!(
+                        ticker = %action.ticker,
+                        channel = %action.channel,
+                        "persisting raw fallback record"
+                    );
+                }
+                if let Err(e) = streams.append(&action.ticker, &action.channel, &action.envelope) {
+                    error!(error = %e, ticker = %action.ticker, channel = %action.channel, "append failed; halting capture");
+                    report.halt_error = Some(e.to_string());
+                    break;
+                }
+                writes_since_check += 1;
+            }
+            vw = verify_rx.recv(), if verify_open => {
+                let Some(VerifyWrite { ticker, env }) = vw else {
+                    verify_open = false;
+                    continue;
+                };
+                report.verify += 1;
+                report.count_write(&ticker, "orderbook");
+                if let Err(e) = streams.append(&ticker, "orderbook", &env) {
+                    error!(error = %e, ticker = %ticker, channel = "orderbook", "verify append failed; halting capture");
+                    report.halt_error = Some(e.to_string());
+                    break;
+                }
+                writes_since_check += 1;
+            }
         }
 
-        writes_since_check += 1;
         if writes_since_check >= DISK_CHECK_EVERY {
             match guard.check() {
                 Ok(free) => report.free_bytes = Some(free),
@@ -227,6 +392,25 @@ async fn writer_task(
         }
     }
 
+    // The main loop exits the instant `rx` yields `None` -- but at that exact
+    // moment `verify_rx` (64 slots) may still hold observations the sweep
+    // already fetched and paid the REST call for; `select!` gives no ordering
+    // guarantee between the two arms, so some can still be sitting unread.
+    // Drain them now rather than silently dropping already-fetched data. Skip
+    // the drain after a halt: a halt means disk/append is already unhealthy,
+    // so touching it further would just risk masking the real error.
+    if report.halt_error.is_none() {
+        while let Ok(VerifyWrite { ticker, env }) = verify_rx.try_recv() {
+            report.verify += 1;
+            report.count_write(&ticker, "orderbook");
+            if let Err(e) = streams.append(&ticker, "orderbook", &env) {
+                error!(error = %e, ticker = %ticker, channel = "orderbook", "verify append failed while draining; halting capture");
+                report.halt_error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+
     // Final free-space reading for the report (best effort).
     if let Ok(free) = guard.check() {
         report.free_bytes = Some(free);
@@ -236,26 +420,53 @@ async fn writer_task(
 
 /// Capture `tickers` (L2 + trades) into append-only JSONL under `base_dir` until
 /// `shutdown` resolves. The reusable core shared by the `capture` CLI command and
-/// the hourly supervisor. Creates `base_dir`, runs the writer + `run_session`
-/// pipeline, prints the run report, and returns it (a mid-run halt is surfaced as
-/// an error after the report prints). Caller supplies credentials + the shutdown
-/// trigger.
+/// every supervisor. Creates `base_dir`, runs the writer + `run_session`
+/// pipeline (plus, when `verify_interval_secs > 0`, a periodic REST verify
+/// sweep — see [`verify_sweep`]), prints the run report, and returns it (a
+/// mid-run halt is surfaced as an error after the report prints). Caller
+/// supplies credentials + the shutdown trigger.
+///
+/// `creds` is an `Arc` (not `&KalshiCredentials`, and `KalshiCredentials` is not
+/// `Clone`) so the verify sweep — a separately spawned, independently-timed task
+/// — can hold its own owned reference without borrowing across the `run_session`
+/// await.
+#[allow(clippy::too_many_arguments)]
 #[instrument(skip(creds, shutdown), fields(tickers = tickers.len(), out = %base_dir))]
 pub async fn capture_session(
-    creds: &KalshiCredentials,
+    creds: Arc<KalshiCredentials>,
     tickers: &[String],
     base_dir: &str,
     floor_bytes: u64,
     capacity: usize,
     idle: Duration,
+    verify_interval_secs: u64,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> anyhow::Result<CaptureReport> {
     std::fs::create_dir_all(base_dir)
         .with_context(|| format!("creating capture dir {base_dir}"))?;
     let (tx, rx) = mpsc::channel::<CaptureEvent>(capacity);
-    let writer = tokio::spawn(writer_task(rx, base_dir.to_string(), floor_bytes));
+    let (verify_tx, verify_rx) = mpsc::channel::<VerifyWrite>(64);
+    let writer = tokio::spawn(writer_task(
+        rx,
+        verify_rx,
+        base_dir.to_string(),
+        floor_bytes,
+    ));
+
+    let sweep = if verify_interval_secs > 0 {
+        Some(tokio::spawn(verify_sweep(
+            Arc::clone(&creds),
+            tickers.to_vec(),
+            Duration::from_secs(verify_interval_secs),
+            verify_tx,
+        )))
+    } else {
+        drop(verify_tx); // no sweep: close the channel so verify_rx sees it, not held open
+        None
+    };
+
     let session_result = run_session(
-        creds,
+        &creds,
         kdp_kalshi::ws::KALSHI_WS_URL,
         tickers,
         tx,
@@ -263,6 +474,11 @@ pub async fn capture_session(
         idle,
     )
     .await;
+
+    if let Some(sweep) = sweep {
+        sweep.abort();
+    }
+
     let report = writer
         .await
         .context("writer task join")?
@@ -278,7 +494,30 @@ pub async fn capture_session(
     session_result.map(|_| report).map_err(anyhow::Error::from)
 }
 
-/// `capture --tickers A,B [--out DIR] [--duration 1h] [--disk-floor-gib N] [--buffer N] [--idle S]`
+/// Parse `--verify-interval` (seconds between periodic REST verify sweeps;
+/// `0` disables the sweep entirely). Default 900 (15 min, matching the
+/// external-methodology-review reference cadence). Shared by every
+/// capture-driving command so the flag behaves identically everywhere.
+///
+/// Nonzero values below 10s are rejected: kdp-process's verify engine keeps at
+/// most one check in flight and force-resolves it when the NEXT verify record
+/// arrives, so the sweep interval must comfortably exceed its 5s tolerance
+/// window or an in-window check could be resolved as a false mismatch.
+pub(crate) fn parse_verify_interval(args: &Args) -> anyhow::Result<u64> {
+    let secs: u64 = args
+        .get_or("verify-interval", "900")
+        .parse()
+        .context("--verify-interval must be a non-negative integer (seconds); 0 disables")?;
+    if (1..10).contains(&secs) {
+        anyhow::bail!(
+            "--verify-interval must be 0 (disabled) or >= 10 seconds (it must exceed the \
+             5s verify tolerance window; got {secs})"
+        );
+    }
+    Ok(secs)
+}
+
+/// `capture --tickers A,B [--out DIR] [--duration 1h] [--disk-floor-gib N] [--buffer N] [--idle S] [--verify-interval 900]`
 #[instrument(skip(args))]
 pub async fn run_capture(args: &Args) -> anyhow::Result<()> {
     let tickers = parse_tickers(args)?;
@@ -309,9 +548,12 @@ pub async fn run_capture(args: &Args) -> anyhow::Result<()> {
         .get_or("idle", "45")
         .parse()
         .context("--idle must be an integer (seconds)")?;
+    let verify_interval_secs = parse_verify_interval(args)?;
 
-    let creds = KalshiCredentials::from_env()
-        .context("loading Kalshi credentials (.env / KDP_KALSHI_PRIVATE_KEY_PATH)")?;
+    let creds = Arc::new(
+        KalshiCredentials::from_env()
+            .context("loading Kalshi credentials (.env / KDP_KALSHI_PRIVATE_KEY_PATH)")?,
+    );
 
     info!(
         ?tickers,
@@ -339,12 +581,13 @@ pub async fn run_capture(args: &Args) -> anyhow::Result<()> {
     };
 
     capture_session(
-        &creds,
+        creds,
         &tickers,
         &base_dir,
         floor_bytes,
         capacity,
         Duration::from_secs(idle_secs),
+        verify_interval_secs,
         shutdown,
     )
     .await?;
@@ -362,10 +605,11 @@ fn print_report(report: &CaptureReport, base_dir: &str) {
     eprintln!("\n=== capture run report ===");
     eprintln!("output dir:      {base_dir}");
     eprintln!(
-        "records written: {} (incl. {} gap markers, {} raw fallbacks)",
+        "records written: {} (incl. {} gap markers, {} raw fallbacks, {} verify sweeps)",
         report.total_written(),
         report.gaps,
-        report.raw
+        report.raw,
+        report.verify
     );
     for ((ticker, channel), count) in &report.per_stream {
         eprintln!("  {ticker} / {channel}: {count}");
@@ -529,5 +773,168 @@ mod tests {
         );
         let action = classify(frame, &mut report).expect("written");
         assert_eq!(action.ticker, UNSAFE_TICKER, "traversal ticker quarantined");
+    }
+
+    use kdp_core::{MicroDollars, PriceLevel, RestingQty};
+
+    #[test]
+    fn verify_envelope_book_outcome_produces_verify_snapshot() {
+        let now = recv();
+        let outcome = RestOrderbookOutcome::Book {
+            ticker: "KXTEST".to_string(),
+            yes: vec![PriceLevel {
+                price: MicroDollars(500_000),
+                quantity: RestingQty(100),
+            }],
+            no: vec![],
+        };
+        let (ticker, env) = verify_envelope(outcome, now);
+        assert_eq!(ticker, "KXTEST");
+        assert_eq!(env.v, kdp_core::ENVELOPE_VERSION);
+        assert_eq!(env.seq, None);
+        assert_eq!(env.sid, None);
+        match env.kind {
+            RecordKind::Verify(snapshot) => {
+                assert_eq!(snapshot.ticker, Ticker("KXTEST".to_string()));
+                assert_eq!(snapshot.ts, now);
+                assert_eq!(snapshot.yes.len(), 1);
+                assert!(snapshot.no.is_empty());
+            }
+            other => panic!("expected RecordKind::Verify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_envelope_undecodable_outcome_preserves_raw_fallback() {
+        let now = recv();
+        let payload = serde_json::json!({"ticker": "KXTEST", "orderbook_fp": "bad"});
+        let outcome = RestOrderbookOutcome::Undecodable {
+            ticker: Some("KXTEST".to_string()),
+            error: "missing orderbook_fp".to_string(),
+            payload: payload.clone(),
+        };
+        let (ticker, env) = verify_envelope(outcome, now);
+        assert_eq!(ticker, "KXTEST");
+        match env.kind {
+            RecordKind::Raw(fallback) => {
+                assert_eq!(fallback.raw_type.as_deref(), Some("rest_orderbook"));
+                assert_eq!(fallback.ticker, Some(Ticker("KXTEST".to_string())));
+                assert_eq!(fallback.error, "missing orderbook_fp");
+                assert_eq!(fallback.payload, payload);
+            }
+            other => panic!("expected RecordKind::Raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_envelope_undecodable_without_ticker_routes_to_unrouted() {
+        // Reuses the exact same "no ticker known" convention the WS raw path
+        // uses (UNROUTED_TICKER = "_unrouted"), not a separate "unknown" stream.
+        let now = recv();
+        let outcome = RestOrderbookOutcome::Undecodable {
+            ticker: None,
+            error: "missing ticker".to_string(),
+            payload: serde_json::Value::Null,
+        };
+        let (ticker, env) = verify_envelope(outcome, now);
+        assert_eq!(ticker, UNROUTED_TICKER);
+        match env.kind {
+            RecordKind::Raw(fallback) => assert_eq!(fallback.ticker, None),
+            other => panic!("expected RecordKind::Raw, got {other:?}"),
+        }
+    }
+
+    fn cli(input: &[&str]) -> Args {
+        Args::parse(input.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn parse_verify_interval_defaults_to_900() {
+        assert_eq!(parse_verify_interval(&cli(&["capture"])).unwrap(), 900);
+    }
+
+    #[test]
+    fn parse_verify_interval_zero_disables() {
+        let a = cli(&["capture", "--verify-interval", "0"]);
+        assert_eq!(parse_verify_interval(&a).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_verify_interval_parses_explicit_value() {
+        let a = cli(&["capture", "--verify-interval", "300"]);
+        assert_eq!(parse_verify_interval(&a).unwrap(), 300);
+    }
+
+    #[test]
+    fn parse_verify_interval_rejects_non_numeric() {
+        let a = cli(&["capture", "--verify-interval", "abc"]);
+        assert!(parse_verify_interval(&a).is_err());
+    }
+
+    #[tokio::test]
+    async fn writer_task_drains_queued_verify_writes_after_ws_channel_closes() {
+        // Regression test for the review finding: the moment `rx` (the WS
+        // channel) yields `None` the loop used to `break` immediately, even
+        // though `verify_rx` might still hold observations the sweep already
+        // fetched (and paid the REST call for). `tokio::select!` randomly
+        // picks among ready branches, so pre-fix this test is FLAKY-FAILS
+        // (it very rarely happens to drain everything by luck before `rx`
+        // wins the race) -- post-fix the trailing drain makes every queued
+        // write survive deterministically, regardless of scheduling.
+        let base_dir = std::env::temp_dir()
+            .join(format!("kdp_cli_writer_drain_{}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let (tx, rx) = mpsc::channel::<CaptureEvent>(8);
+        let (verify_tx, verify_rx) = mpsc::channel::<VerifyWrite>(64);
+
+        const N: usize = 20;
+        for _ in 0..N {
+            verify_tx
+                .send(VerifyWrite {
+                    ticker: "KXTEST".to_string(),
+                    env: Envelope::new(
+                        recv(),
+                        None,
+                        None,
+                        RecordKind::Verify(OrderbookSnapshot {
+                            ticker: Ticker("KXTEST".to_string()),
+                            ts: recv(),
+                            yes: vec![],
+                            no: vec![],
+                        }),
+                    ),
+                })
+                .await
+                .expect("channel has room");
+        }
+        drop(verify_tx);
+        drop(tx); // the WS session is already over: rx.recv() resolves to None right away
+
+        let report = writer_task(rx, verify_rx, base_dir.clone(), 1)
+            .await
+            .expect("writer_task ok");
+
+        assert!(report.halt_error.is_none());
+        assert_eq!(
+            report.verify, N as u64,
+            "every already-fetched verify write must be persisted, never dropped, at session end"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn parse_verify_interval_rejects_nonzero_below_window_floor() {
+        // The verify engine holds one check at a time and force-resolves it
+        // when the next verify arrives; a sweep interval inside the 5s window
+        // could turn an in-window check into a false mismatch.
+        let a = cli(&["capture", "--verify-interval", "2"]);
+        assert!(parse_verify_interval(&a).is_err());
+        let ok = cli(&["capture", "--verify-interval", "10"]);
+        assert_eq!(parse_verify_interval(&ok).unwrap(), 10);
     }
 }

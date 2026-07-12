@@ -14,6 +14,7 @@
 mod args;
 mod backfill;
 mod capture;
+mod catalog;
 mod discover;
 mod hourly;
 mod schedule;
@@ -44,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         Some("capture-hourly") => hourly::run_hourly(&parsed).await?,
         Some("capture-scheduled") => scheduled::run_scheduled(&parsed).await?,
         Some("capture-universe") => universe::run_universe(&parsed).await?,
+        Some("catalog") => catalog::run_catalog(&parsed).await?,
         Some("discover") => discover::run_discover(&parsed).await?,
         Some("backfill") => backfill::run_backfill(&parsed).await?,
         Some(other) => {
@@ -96,22 +98,29 @@ fn print_usage() {
          \x20 ws-probe --tickers A,B [--frames N] [--idle S]\n\
          \x20                                         live WS connect + subscribe + log frames\n\
          \x20 capture --tickers A,B [--out DIR] [--duration 1h] [--disk-floor-gib N]\n\
-         \x20                                         capture live L2 + trades to JSONL\n\
+         \x20         [--verify-interval 900]\n\
+         \x20                                         capture live L2 + trades to JSONL; every --verify-interval\n\
+         \x20                                         seconds (0 disables), cross-check via a REST orderbook sweep\n\
          \x20 capture-hourly [--series KXBTCD] [--band 25] [--out DIR] [--grace 180] [--poll 30]\n\
+         \x20                [--verify-interval 900]\n\
          \x20                                         forever: per-hour near-money L2+trade capture ->\n\
          \x20                                         settle -> background archive (process/curate/Drive/prune)\n\
          \x20 capture-scheduled --schedule FILE [--out DIR] [--arm-lead-min 60] [--max-hours 8]\n\
          \x20                   [--grace 180] [--poll 30] [--resolve-grace 1800] [--archive-cmd PATH]\n\
+         \x20                   [--verify-interval 900]\n\
          \x20                                         capture pre-scheduled events from a JSONL schedule: arm each\n\
          \x20                                         at start-lead, resolve its markets (predicted ticker or by\n\
          \x20                                         teams), capture L2+trades -> settle -> background archive\n\
          \x20 capture-universe --series A,B,C --name NAME [--status open] [--min-volume 0]\n\
          \x20                  [--rediscover-interval 300] [--max-units 8] [--out DIR] [--max-hours 8]\n\
-         \x20                  [--grace 180] [--poll 30] [--archive-cmd PATH]\n\
+         \x20                  [--grace 180] [--poll 30] [--archive-cmd PATH] [--verify-interval 900]\n\
          \x20                                         declaratively capture EVERY event in the series matching the\n\
          \x20                                         filter: sweep, arm each new event cohort (cap: --max-units,\n\
          \x20                                         loud warn past it), settle -> background archive; re-sweeps\n\
          \x20                                         every --rediscover-interval for newly-listed markets\n\
+         \x20 catalog [--category NAME | --series TICKER] [--limit N]\n\
+         \x20                                         browse what's on Kalshi, ranked by volume; --series emits a\n\
+         \x20                                         ready-to-run capture command\n\
          \x20 discover [--query SUB] [--series TICKER] [--status S] [--pages N] [--limit N]\n\
          \x20                                         find markets (omit --status for all; e.g. --series KXIPLGAME)\n\
          \x20 backfill (--tickers A,B | --series TICKER | --markets-file F) [--out DIR] [--since 24h] [--rate N]\n\

@@ -60,6 +60,7 @@ data_mlb_processed/
    ├─ trades.parquet          the executed-trade tape
    ├─ gaps.parquet            detected holes (usually empty)
    ├─ raw.parquet             undecodable messages (only if any)
+   ├─ verify.parquet          REST cross-check verdicts (only if sweeps ran)
    └─ manifest.json           provenance + the "safe to drop raw?" flag
 ```
 
@@ -139,6 +140,7 @@ stamp, which was measured running **~1.2 s fast**. For ordering and timing, **us
 | **`book_events`** | one price-level change | *rebuild the full book at any instant* | 🟡 when you need depth/fidelity |
 | **`gaps`** | one detected hole | *did we miss data?* | ⚪ trust-check (usually empty) |
 | **`raw`** | one undecodable message | *what couldn't be parsed?* | ⚪ rare (often absent) |
+| **`verify`** | one REST cross-check | *did the replayed book match the venue?* | ⚪ trust-check (only if sweeps ran) |
 | `manifest.json` | — | *provenance + safe to drop raw?* | the receipt |
 
 Rule of thumb: **`book_top` for price, `trades` for fills, `gaps` to confirm it's
@@ -274,15 +276,38 @@ sanity check.)
 Usually silent. When they're not, look before trusting the rest.
 
 **`gaps`** — one row per detected hole in the stream (a sequence jump, a
-reconnect, or a deliberate resubscribe). Columns: `recv_ts_us, seq, reason,
-channel, last_seq, observed_seq, detail`. **This — not `seq` continuity — is the
-real "did we lose data" signal.** An empty `gaps` table means the capture is whole.
+reconnect, a deliberate resubscribe, or a `verify_mismatch` — see below).
+Columns: `recv_ts_us, seq, reason, channel, last_seq, observed_seq, detail`.
+**This — not `seq` continuity — is the real "did we lose data" signal.** An
+empty `gaps` table means the capture is whole.
 
 **`raw`** — one row per message the parser *couldn't* decode at capture time,
 preserved verbatim so nothing is ever silently dropped. Columns: `recv_ts_us, seq,
 channel, raw_type, ticker, error, payload_json` (`payload_json` is the original
 message). **This file only exists if there were any.** If present, review it before
 deleting the raw.
+
+**`verify`** — one row per REST cross-check. During capture the tool
+periodically fetches the venue's *own* REST order book (`--verify-interval`,
+default every 15 min; `0` disables) and stores it inline as an observation;
+at processing time each observation is diffed against the book replayed from
+the captured stream. This catches what sequence tracking structurally cannot:
+a venue-side emission bug (a delta never sent under a continuous `seq`) or a
+decode/replay bug on our side. Columns: `recv_ts_us, outcome, match_lag_us,
+yes_levels_json, no_levels_json, detail` — the REST observation itself is
+preserved losslessly as integer `[[price_micro, qty_centi], …]` pairs.
+Outcomes:
+
+| `outcome` | Meaning |
+|---|---|
+| `matched` | the replayed book equals the venue's book at some instant within a ±5 s tolerance window (`match_lag_us` = signed offset to the matching instant — absorbs deltas in flight between the REST fetch and the WS stream) |
+| `mismatch` | no instant in the window matched — the books genuinely diverged; a `gaps` row with `reason: "verify_mismatch"` is also written (the book is suspect from that instant until the next real snapshot re-anchors it) and the processor logs a warning |
+| `skipped_gap` | the book was already suspect from an unresolved gap, so no verdict was rendered (a mismatch here would be a lie) |
+| `truncated` | the capture ended inside the check's tolerance window; verdict withheld |
+
+**This file only exists if verify sweeps ran.** Old captures (before the sweep
+existed) simply have no `verify` table and `null` verification columns in
+`coverage()` — absence of a check is never presented as a passing one.
 
 ---
 
@@ -292,9 +317,11 @@ Every ticker gets a `manifest.json` — the receipt. It records provenance (sour
 files, time span), per-table row counts, and the all-important verdict:
 
 ```jsonc
-{ "counts": { "book_events": 8305, "book_top": 8228, "trades": 400, "gaps": 0, "raw": 0 },
+{ "counts": { "book_events": 8305, "book_top": 8228, "trades": 400, "gaps": 0, "raw": 0, "verify": 4 },
   "read_errors": 0,
   "complete": true,
+  "verify_checks": 4, "verify_mismatches": 0, "verify_skipped": 0,
+  "underflows": 0,
   "notes": ["all source records decoded into the structured tables; the raw capture files are safe to drop once these outputs are verified"] }
 ```
 
@@ -309,6 +336,18 @@ the structured tables are the whole story. If either is non-zero, `complete` is
 `false`: the data is still preserved (unreadable lines → `read_errors.jsonl`, raw
 fallbacks → `raw.parquet`), but you should review before deleting, because the
 structured tables alone aren't the complete picture.
+
+**The verification fields are a separate trust axis.** `verify_checks` /
+`verify_mismatches` / `verify_skipped` summarize the `verify` table (REST
+cross-checks, §8), and `underflows` counts deltas that drove a price level
+*strictly below zero* during replay (a consistency signal — a legitimate full
+cancel lands exactly on zero and does not count). **None of these affect
+`complete`**: `complete` certifies that the structured tables faithfully
+represent *what was captured* (capture→table); the verification fields speak
+to whether what was captured matches *what the venue had* (capture→venue). A
+capture can be `complete: true` and still carry a mismatch — both facts are
+reported, neither is hidden in the other. Manifests written before these
+fields existed simply lack them (readers surface `null`, never a fake `0`).
 
 > **The golden rule:** delete a raw capture **only** when its `manifest.complete`
 > is `true` and you've verified the output. The lossless `book_events` table is
@@ -428,11 +467,14 @@ canonical stream. See `python/README.md`.
 **Trusting it (Python): `coverage` / `holes`.** Before building on a dataset,
 account for its holes: `coverage(entries)` returns one row per directory —
 capture span, unioned hole time (each `gaps` row runs to the first
-re-anchoring snapshot after it), `uptime`, unresolved-gap count, and the
-manifest's `complete`/`reasons` as columns (coverage reads incomplete dirs by
+re-anchoring snapshot after it), `uptime`, unresolved-gap count, the
+manifest's `complete`/`reasons`, and the verification stats
+(`verify_checks`/`verify_mismatches`/`underflows` — `null` for directories
+processed before those existed) as columns (coverage reads incomplete dirs by
 design; it is the reporting side of the honesty gate). `holes(entry)` gives
-the per-gap windows. This is the dataset-level answer to "where are the holes
-and what fraction of the window is trustworthy."
+the per-gap windows — a `verify_mismatch` row opens a hole like any other gap
+and closes at the next real snapshot. This is the dataset-level answer to
+"where are the holes and what fraction of the window is trustworthy."
 
 ---
 
@@ -447,8 +489,9 @@ utc=True)`. **Trust `recv_ts_us`** (exchange `event_ts_us` runs ~1.2 s fast).
 `seq` skips numbers in one file — normal; `gaps` is the real loss signal.
 
 **Files:** `book_top` (price over time) · `trades` (fills) · `book_events`
-(lossless log → full depth via replay) · `gaps`/`raw` (smoke detectors) ·
-`manifest.json` (`complete: true` ⇒ safe to drop raw).
+(lossless log → full depth via replay) · `gaps`/`raw`/`verify` (smoke
+detectors) · `manifest.json` (`complete: true` ⇒ safe to drop raw;
+`verify_mismatches`/`underflows` = capture-to-venue trust, separate axis).
 
 **`book_events` replay:** empty → `is_snapshot` row *sets* a level (absolute) →
 delta row `+= qty_centi` (signed; drop at 0). `event_idx` groups a message and
@@ -476,7 +519,13 @@ joins to `book_top`.
 - **`event_idx`** — per-message ordinal; groups `book_events` rows and joins to
   `book_top`.
 - **`seq` / `sid`** — the wire sequence number and subscription id.
-- **gap** — a recorded hole in the stream (sequence jump / reconnect / resubscribe).
+- **gap** — a recorded hole in the stream (sequence jump / reconnect /
+  resubscribe / verify mismatch).
 - **raw fallback** — a message the parser couldn't decode, preserved verbatim.
+- **verify check** — a REST order-book observation taken during capture and
+  diffed offline against the replayed book (±5 s tolerance window); the
+  independent cross-check that seq tracking can't provide.
+- **underflow** — a delta that drove a price level strictly below zero during
+  replay; counted in the manifest as a consistency signal.
 - **drop-safe / `complete`** — the manifest's certification that the raw JSONL can
   be deleted.

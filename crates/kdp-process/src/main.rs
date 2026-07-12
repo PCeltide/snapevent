@@ -19,6 +19,7 @@ mod process;
 mod reader;
 
 mod tables;
+mod verify;
 mod writer;
 
 use std::path::{Path, PathBuf};

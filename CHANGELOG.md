@@ -7,6 +7,45 @@ section per public release. The format follows
 = fixes). The public repo's git history is one squashed commit per release,
 so this file is the authoritative change record.
 
+## [0.2.0] - 2026-07-12
+
+### Added
+
+- **`kdp-cli catalog`** — answer "what should I capture?" without knowing
+  Kalshi: browse categories → series → live markets, ranked by traded
+  volume (`catalog`, `catalog --category NAME`, `catalog --series TICKER`);
+  the series drill-down shows the live picture (open markets, lifetime +
+  24h volume, top movers) and ends in a ready-to-paste `capture-universe`
+  command. Public endpoints, no credentials needed.
+- **REST order-book cross-verification** (capture hardening): capture now
+  periodically fetches the venue's own REST order book for every session
+  ticker (`--verify-interval`, default 900 s, `0` disables; batched, ≤100
+  tickers/request) and persists each observation inline; `kdp-process` diffs
+  it against the replayed book within a ±5 s tolerance window and writes a
+  new `verify` table (`matched` / `mismatch` / `skipped_gap` / `truncated`).
+  A mismatch also synthesizes a `gaps` row (`reason: "verify_mismatch"`) and
+  a warning — catching venue-side emission bugs and decode/replay bugs that
+  sequence tracking structurally cannot.
+- **Book underflow counter**: a delta driving a price level strictly below
+  zero during replay is now counted (`underflows` in the manifest and on the
+  replay `Book`) instead of being pruned silently.
+- **Manifest fields** `verify_checks` / `verify_mismatches` /
+  `verify_skipped` / `underflows` and `counts.verify`; `kdp-data`'s
+  `coverage()` and `DatasetIndex.to_frame()` surface them as nullable columns
+  (`null` for output processed before these existed — never a fabricated 0).
+  None of them affect `complete`, which keeps its exact meaning
+  (capture-to-table structural fidelity; verification is the capture-to-venue
+  axis).
+
+### Changed
+
+- **Capture JSONL envelope version is now 2** (adds the `verify` record
+  kind). v1 files remain fully readable; a pre-0.2 `kdp-process` binary
+  refuses v2 captures loudly (`UnsupportedVersion`) instead of misreading
+  them — rebuild both binaries together when updating a capture host.
+  Processed-output schema is unchanged (`PROCESSED_SCHEMA_VERSION` stays 1;
+  the new table and manifest fields are additive).
+
 ## [0.1.0] - 2026-07-11
 
 Initial public release.

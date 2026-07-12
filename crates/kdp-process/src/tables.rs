@@ -74,6 +74,7 @@ fn gap_reason_str(r: GapReason) -> &'static str {
         GapReason::SeqJump => "seq_jump",
         GapReason::Reconnect => "reconnect",
         GapReason::Resubscribe => "resubscribe",
+        GapReason::VerifyMismatch => "verify_mismatch",
     }
 }
 
@@ -485,6 +486,49 @@ impl RawTable {
                 ("ticker", opt_str_col(self.ticker), true),
                 ("error", str_col(self.error), false),
                 ("payload_json", str_col(self.payload_json), false),
+            ],
+        )
+    }
+}
+
+// --- verify ------------------------------------------------------------------
+
+/// REST cross-verification outcomes -- one row per `RecordKind::Verify`
+/// observation, resolved by [`crate::verify::VerifyEngine`]. Usually all
+/// `"matched"`; see that module for the outcome vocabulary.
+#[derive(Debug, Default)]
+pub struct VerifyTable {
+    recv_ts_us: Vec<i64>,
+    outcome: Vec<&'static str>,
+    match_lag_us: Vec<Option<i64>>,
+    yes_levels_json: Vec<String>,
+    no_levels_json: Vec<String>,
+    detail: Vec<String>,
+}
+
+impl VerifyTable {
+    /// Append one resolved verify outcome.
+    pub fn push(&mut self, row: &crate::verify::VerifyOutcomeRow) {
+        self.recv_ts_us.push(row.recv_ts_us);
+        self.outcome.push(row.outcome);
+        self.match_lag_us.push(row.match_lag_us);
+        self.yes_levels_json.push(row.yes_levels_json.clone());
+        self.no_levels_json.push(row.no_levels_json.clone());
+        self.detail.push(row.detail.clone());
+    }
+
+    /// Consume the builder into a typed [`RecordBatch`].
+    #[tracing::instrument(skip_all)]
+    pub fn finish(self) -> Result<RecordBatch> {
+        build(
+            "verify",
+            vec![
+                ("recv_ts_us", i64_col(self.recv_ts_us), false),
+                ("outcome", str_col(self.outcome), false),
+                ("match_lag_us", opt_i64_col(self.match_lag_us), true),
+                ("yes_levels_json", str_col(self.yes_levels_json), false),
+                ("no_levels_json", str_col(self.no_levels_json), false),
+                ("detail", str_col(self.detail), false),
             ],
         )
     }

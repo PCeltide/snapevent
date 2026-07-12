@@ -108,8 +108,59 @@ def test_to_frame_has_one_row_per_entry():
     assert set(["ticker", "path", "complete", "date"]).issubset(frame.columns)
 
 
+def test_to_frame_verify_columns_have_stable_int64_dtype_even_when_all_none():
+    # Both committed fixtures predate the verify fields, so all three columns
+    # are all-None here; Polars infers Null (not Int64) for an all-None column
+    # unless told otherwise, which would make the schema dataset-dependent
+    # (Int64 once any manifest has real values, Null when none do).
+    frame = DatasetIndex.build(FIXTURES).to_frame()
+    for col in ("verify_checks", "verify_mismatches", "underflows"):
+        assert frame.schema[col] == pl.Int64, f"{col} must be Int64 even when all-None"
+
+
 def test_read_entry_single_dir():
     e = read_entry(PURE_WS)
     assert isinstance(e, Entry)
     assert e.complete is True
     assert e.tables["trades"] == 18
+
+
+def test_old_manifest_without_verify_fields_is_none_not_zero():
+    # Both committed fixtures predate the verify phase: never fabricate 0.
+    e = read_entry(PURE_WS)
+    assert e.verify_checks is None
+    assert e.verify_mismatches is None
+    assert e.underflows is None
+
+
+def _verify_manifest(tmp_path, ticker="KXVERIFY", **overrides):
+    d = tmp_path / ticker
+    d.mkdir()
+    manifest = {
+        "schema_version": 1, "ticker": ticker, "format": "parquet",
+        "complete": True, "read_errors": 0,
+        "counts": {
+            "book_events": 0, "book_top": 0, "trades": 0, "gaps": 0, "raw": 0,
+            "verify": 5,
+        },
+        "verify_checks": 5, "verify_mismatches": 1, "verify_skipped": 0,
+        "underflows": 2,
+    }
+    manifest.update(overrides)
+    (d / "manifest.json").write_text(json.dumps(manifest))
+    return d
+
+
+def test_manifest_with_verify_fields_surfaces_them(tmp_path):
+    d = _verify_manifest(tmp_path)
+    e = read_entry(d)
+    assert e.verify_checks == 5
+    assert e.verify_mismatches == 1
+    assert e.underflows == 2
+    assert e.tables["verify"] == 5  # counts.verify flows via the existing counts parse
+
+
+def test_malformed_verify_field_is_typed(tmp_path):
+    d = _verify_manifest(tmp_path, underflows="abc")
+    with pytest.raises(KdpDataError):
+        read_entry(d)

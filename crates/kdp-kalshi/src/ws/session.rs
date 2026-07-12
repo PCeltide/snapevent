@@ -407,6 +407,9 @@ fn frame_label(frame: &DecodedFrame) -> Cow<'static, str> {
             RecordKind::Trade(_) => "trade",
             RecordKind::Gap(_) => "gap",
             RecordKind::Raw(_) => "raw",
+            // ponytail: capture never emits Verify (kdp-process synthesizes it
+            // offline); arm exists only so this match stays exhaustive.
+            RecordKind::Verify(_) => "verify",
         }),
         FrameOutcome::Control { msg_type } => Cow::Owned(format!("control:{msg_type}")),
         FrameOutcome::ServerError { .. } => Cow::Borrowed("error"),

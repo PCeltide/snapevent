@@ -38,6 +38,12 @@ class Entry:
     complete: bool
     reasons: tuple[str, ...]
     date: date | None
+    # Verification stats (new in the 2026-07-11 capture-hardening pass); None
+    # when the manifest predates them -- never a fabricated 0. Defaulted so
+    # pre-existing Entry constructions keep working.
+    verify_checks: int | None = None
+    verify_mismatches: int | None = None
+    underflows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,13 @@ def _event_date(ticker: str) -> date | None:
         return None
 
 
+def _optional_int(raw: dict, key: str) -> int | None:
+    """``raw[key]`` as int, or None when the key is absent (old manifest) --
+    never a fabricated 0. A present-but-malformed value raises like any other
+    manifest field (caught by the caller's shared except clause)."""
+    return None if key not in raw else int(raw[key])
+
+
 def read_entry(dir_path: Path) -> Entry:
     """Read + validate one directory's ``manifest.json`` into an Entry.
 
@@ -82,6 +95,9 @@ def read_entry(dir_path: Path) -> Entry:
         complete = bool(raw["complete"])
         read_errors = int(raw["read_errors"])
         counts = {k: int(v) for k, v in raw["counts"].items()}
+        verify_checks = _optional_int(raw, "verify_checks")
+        verify_mismatches = _optional_int(raw, "verify_mismatches")
+        underflows = _optional_int(raw, "underflows")
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         # AttributeError covers shape errors like a non-dict "counts".
         raise KdpDataError(f"{manifest_path}: malformed manifest field: {exc}") from exc
@@ -104,6 +120,9 @@ def read_entry(dir_path: Path) -> Entry:
         complete=complete,
         reasons=tuple(reasons),
         date=_event_date(ticker),
+        verify_checks=verify_checks,
+        verify_mismatches=verify_mismatches,
+        underflows=underflows,
     )
 
 
@@ -171,5 +190,18 @@ class DatasetIndex:
                 "book_top": [e.tables.get("book_top", 0) for e in self._entries],
                 "book_events": [e.tables.get("book_events", 0) for e in self._entries],
                 "gaps": [e.tables.get("gaps", 0) for e in self._entries],
-            }
+                "verify_checks": [e.verify_checks for e in self._entries],
+                "verify_mismatches": [e.verify_mismatches for e in self._entries],
+                "underflows": [e.underflows for e in self._entries],
+            },
+            # When every manifest predates the verify fields, these three
+            # columns are all None; Polars would otherwise infer Null (a
+            # dataset-dependent schema -- Int64 once any manifest carries a
+            # real value, Null when none do). Pin the dtype so a consumer's
+            # schema never depends on which manifests happen to be present.
+            schema_overrides={
+                "verify_checks": pl.Int64,
+                "verify_mismatches": pl.Int64,
+                "underflows": pl.Int64,
+            },
         )

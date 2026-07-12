@@ -78,6 +78,8 @@ pub struct UnitCfg {
     pub max_secs: u64,
     /// Path to kdp-archive.sh (empty = skip archive, for dev/capture-only).
     pub archive_cmd: String,
+    /// Periodic REST verify-sweep interval (seconds); `0` disables it.
+    pub verify_interval_secs: u64,
 }
 
 /// Run one unit end-to-end: capture `unit.tickers` into `data_dir/<session>`
@@ -87,8 +89,13 @@ pub struct UnitCfg {
 ///
 /// This is the generalised body of the old `run_one_hour` -- the
 /// correctness-critical orchestration shared by every supervisor.
+///
+/// `creds` is an `Arc` (`KalshiCredentials` is not `Clone`) so `capture_session`
+/// can hand a clone to its own periodic verify-sweep task without borrowing
+/// across an await; every caller already builds one `Arc<KalshiCredentials>`
+/// once at startup and clones it per spawned unit.
 pub async fn run_capture_unit(
-    creds: &KalshiCredentials,
+    creds: Arc<KalshiCredentials>,
     client: &reqwest::Client,
     unit: &CaptureUnit,
     cfg: &UnitCfg,
@@ -159,6 +166,7 @@ pub async fn run_capture_unit(
         cfg.floor_bytes,
         cfg.capacity,
         Duration::from_secs(cfg.idle_secs),
+        cfg.verify_interval_secs,
         shutdown,
     )
     .await
@@ -341,6 +349,7 @@ mod tests {
             yes_bid_dollars: None,
             yes_ask_dollars: None,
             last_price_dollars: None,
+            volume_24h_fp: None,
         }
     }
 

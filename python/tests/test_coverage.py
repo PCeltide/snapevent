@@ -9,7 +9,9 @@ from conftest import MIXED, PURE_WS
 from kdp_data import KdpDataError, MissingTable, coverage, holes
 
 
-def _synthetic_book_dir(tmp_path, *, book, gaps, trades=None, complete=True):
+def _synthetic_book_dir(
+    tmp_path, *, book, gaps, trades=None, complete=True, gap_reasons=None, manifest_overrides=None
+):
     """A minimal manifest dir: book = [(recv_ts_us, is_snapshot)], gaps =
     [recv_ts_us] or None to omit the file, trades = [event_ts_us]."""
     d = tmp_path / "KDPSYNTH-COV"
@@ -29,6 +31,8 @@ def _synthetic_book_dir(tmp_path, *, book, gaps, trades=None, complete=True):
         "read_errors": 0,
         "counts": counts,
     }
+    if manifest_overrides:
+        manifest.update(manifest_overrides)
     (d / "manifest.json").write_text(json.dumps(manifest))
     if book is not None:
         pl.DataFrame(
@@ -36,10 +40,11 @@ def _synthetic_book_dir(tmp_path, *, book, gaps, trades=None, complete=True):
             schema={"recv_ts_us": pl.Int64, "is_snapshot": pl.Boolean},
         ).write_parquet(d / "book_events.parquet")
     if gaps is not None:
+        reasons = gap_reasons if gap_reasons is not None else ["seq_jump"] * len(gaps)
         pl.DataFrame(
             {
                 "recv_ts_us": gaps,
-                "reason": ["seq_jump"] * len(gaps),
+                "reason": reasons,
                 "channel": ["orderbook_delta"] * len(gaps),
                 "detail": [""] * len(gaps),
             },
@@ -178,3 +183,43 @@ def test_list_target_stacks_and_empty_list_is_typed():
     assert df.get_column("ticker").n_unique() == 2
     with pytest.raises(KdpDataError):
         coverage([])
+
+
+def test_old_manifest_coverage_has_null_verify_columns():
+    # PURE_WS predates the verify phase: columns present, values null.
+    row = coverage(PURE_WS).row(0, named=True)
+    assert row["verify_checks"] is None
+    assert row["verify_mismatches"] is None
+    assert row["underflows"] is None
+
+
+def test_manifest_with_verify_fields_surfaces_in_coverage(tmp_path):
+    d = _synthetic_book_dir(
+        tmp_path,
+        book=[(1_000_000, True)],
+        gaps=[],
+        manifest_overrides={
+            "verify_checks": 5, "verify_mismatches": 1, "verify_skipped": 0, "underflows": 2,
+        },
+    )
+    row = coverage(d).row(0, named=True)
+    assert row["verify_checks"] == 5
+    assert row["verify_mismatches"] == 1
+    assert row["underflows"] == 2
+
+
+def test_verify_mismatch_gap_row_resolves_like_any_other_gap(tmp_path):
+    # A gaps row with reason == "verify_mismatch" is an ordinary gap
+    # semantically: the hole opens there and closes at the next snapshot at
+    # or after it. holes() needs no special-casing for the reason string.
+    d = _synthetic_book_dir(
+        tmp_path,
+        book=[(1_000_000, True), (2_000_000, True)],
+        gaps=[1_500_000],
+        gap_reasons=["verify_mismatch"],
+    )
+    row = holes(d).row(0, named=True)
+    assert row["reason"] == "verify_mismatch"
+    assert row["hole_end_us"] == 2_000_000
+    assert row["hole_us"] == 500_000
+    assert row["resolved"] is True

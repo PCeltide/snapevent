@@ -43,6 +43,12 @@ re-anchoring snapshot after it (unresolved holes run to the span end);
 overlapping holes are unioned and clamped to the observed span, so `uptime`
 stays in `[0, 1]` — a gap outside the span signals via `n_unresolved_gaps`;
 trades-only dirs report null gap metrics (uptime is an L2-capture concept).
+Coverage also carries the manifest's verification stats as nullable columns —
+`verify_checks` / `verify_mismatches` (REST cross-checks of the replayed book
+against the venue's own order book) and `underflows` (deltas that drove a
+level strictly below zero during replay). They are `null` for directories
+processed before those fields existed — absence of a check is never shown as
+a passing one. A `verify_mismatch` gaps row opens a hole like any other gap.
 Rollups are one `group_by` away:
 
     cov.group_by("date").agg(pl.mean("uptime"), pl.sum("hole_us"))

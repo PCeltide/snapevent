@@ -47,6 +47,7 @@ struct SchedCfg {
     /// How long past `arm_at` to keep retrying resolution before giving up (s).
     resolve_grace: u64,
     archive_cmd: String,
+    verify_interval_secs: u64,
 }
 
 /// Match the markets belonging to a scheduled entry, returning the tickers to
@@ -227,6 +228,7 @@ pub async fn run_scheduled(args: &crate::args::Args) -> anyhow::Result<()> {
         archive_cmd: args
             .get_or("archive-cmd", "/opt/kdp/bin/kdp-archive.sh")
             .to_string(),
+        verify_interval_secs: crate::capture::parse_verify_interval(args)?,
     };
 
     let entries = load_schedule(Path::new(schedule_path))?;
@@ -301,12 +303,13 @@ pub async fn run_scheduled(args: &crate::args::Args) -> anyhow::Result<()> {
             poll_secs: cfg.poll_secs,
             max_secs: entry.max_hours.unwrap_or(cfg.default_max_hours) * 3600,
             archive_cmd: cfg.archive_cmd.clone(),
+            verify_interval_secs: cfg.verify_interval_secs,
         };
         let creds2 = Arc::clone(&creds);
         let client2 = client.clone();
         let srx = shutdown_rx.clone();
         inflight.push(tokio::spawn(async move {
-            run_capture_unit(&creds2, &client2, &unit, &unit_cfg, srx).await;
+            run_capture_unit(creds2, &client2, &unit, &unit_cfg, srx).await;
         }));
     }
 
@@ -371,6 +374,7 @@ mod tests {
             yes_bid_dollars: None,
             yes_ask_dollars: None,
             last_price_dollars: None,
+            volume_24h_fp: None,
         }
     }
 
