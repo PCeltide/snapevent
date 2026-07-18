@@ -19,6 +19,9 @@ apt-get install -y -qq chrony jq rclone ufw tar gzip curl ca-certificates >/dev/
 say "user + directories"
 id kdp &>/dev/null || useradd --system --create-home --home-dir /home/kdp --shell /usr/sbin/nologin kdp
 install -d -o kdp -g kdp /opt/kdp/bin /var/lib/kdp /var/lib/kdp/data /var/lib/kdp/processed
+# Alert throttle state (kdp-health runs as kdp; a root-owned dir here would make
+# every throttle write fail silently and restore the push spam it prevents).
+install -d -o kdp -g kdp /var/lib/kdp/alert-state
 install -d -m 750 -o kdp -g kdp /etc/kdp /etc/kdp/sessions /etc/kdp/schedules
 install -d -m 700 -o kdp -g kdp /home/kdp/.config /home/kdp/.config/rclone
 
@@ -88,7 +91,16 @@ if (( todo == 0 )); then
 else
   echo "  ...then:  systemctl start kdp-capture@<session>"
 fi
-echo "  kdp-hourly.service installed (DISABLED). Start forward hourly capture with: systemctl enable --now kdp-hourly"
-echo "  kdp-scheduled.service installed (DISABLED). Set KDP_SCHEDULE_FILE in kdp.env, then: systemctl enable --now kdp-scheduled"
+# Report each optional unit's REAL state — a re-run on a live box was claiming
+# "(DISABLED)" about units that were enabled and running.
+unit_note() {  # $1 = unit, $2 = hint to print only when it's disabled
+  if systemctl is-enabled --quiet "$1" 2>/dev/null; then
+    echo "  $1 installed, ENABLED ($(systemctl is-active "$1" 2>/dev/null || true)) — restart it to pick up the new binary."
+  else
+    echo "  $1 installed (DISABLED). $2"
+  fi
+}
+unit_note kdp-hourly.service    "Start forward hourly capture with: systemctl enable --now kdp-hourly"
+unit_note kdp-scheduled.service "Set KDP_SCHEDULE_FILE in kdp.env, then: systemctl enable --now kdp-scheduled"
 echo
 echo "done."

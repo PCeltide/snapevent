@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kdp-data"
-version = "0.2.0"
+version = "0.2.1"
 description = "Dataset index + Polars loaders for kdp-processed Kalshi market data"
 license = "MIT OR Apache-2.0"
 requires-python = ">=3.11"

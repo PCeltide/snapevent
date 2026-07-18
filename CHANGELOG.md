@@ -7,6 +7,39 @@ section per public release. The format follows
 = fixes). The public repo's git history is one squashed commit per release,
 so this file is the authoritative change record.
 
+## [0.2.1] - 2026-07-19
+
+### Added
+
+- **`kdp-load` runnable replay tour** — `cargo run -p kdp-load --example
+  replay_tour` walks the full-depth replay API (open → completeness verdict →
+  merged typed stream → point-in-time ladder via `between`) against the
+  crate's committed fixture, so it works before you've captured anything;
+  point it at any processed ticker directory with an argument. The data
+  guide's `kdp-load` section now also documents that REST `verify`
+  observations are not replay events (take "capture end" from the manifest,
+  never from the stream's last timestamp).
+
+### Fixed
+
+- **`kdp-data` now indexes the day tarballs the backfill actually writes.**
+  `DatasetIndex.build` only matched `YYYY-MM-DD.tar.gz`, but
+  `scripts/stream-backfill.sh` emits tier-suffixed names
+  (`<day>.archive.tar.gz` / `<day>.live.tar.gz`), so every real backfill tar
+  was silently absent from `tar_entries()`. Both tiered shapes now match
+  (found exercising the loaders against a real backfill archive); a
+  cutoff-seam day's two tiers extract to separate directories.
+- **Deploy alerting no longer spams on a persistent failure.** `kdp-health`
+  re-pushed an identical webhook alert on every timer tick for as long as a
+  problem lasted (one stuck unit produced 186 identical pushes in 24 h). It
+  now logs every occurrence but pushes each distinct subject at most once per
+  `KDP_ALERT_THROTTLE_SEC` (default 3600), sends one "recovered" all-clear on
+  the first fully-clean run, and tags pushes with ntfy `Title`/`Priority`/
+  `Tags` headers (failures urgent, routine archive progress silent). New
+  knobs: `KDP_ALERT_THROTTLE_SEC`, `KDP_ALERT_STATE_DIR`.
+- `deploy/install.sh` reported optional units as `(DISABLED)` even when they
+  were enabled and running; it now reports their real state.
+
 ## [0.2.0] - 2026-07-12
 
 ### Added

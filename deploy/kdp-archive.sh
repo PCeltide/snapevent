@@ -37,8 +37,11 @@ if [[ -f "$ENV_FILE" ]]; then set -a; . "$ENV_FILE"; set +a; fi
 RCLONE_PACE=(--tpslimit "$KDP_RCLONE_TPSLIMIT" --low-level-retries 10)
 
 log()    { printf '[%s] kdp-archive: %s\n' "$(date -u +%FT%TZ)" "$*"; }
-notify() { log "$*";        [[ -n "$KDP_ALERT_WEBHOOK" ]] && curl -fsS -m 15 --data-binary "kdp-archive: $*" "$KDP_ALERT_WEBHOOK" >/dev/null 2>&1 || true; }
-alert()  { log "ALERT: $*"; [[ -n "$KDP_ALERT_WEBHOOK" ]] && curl -fsS -m 15 --data-binary "kdp-archive: ALERT: $*" "$KDP_ALERT_WEBHOOK" >/dev/null 2>&1 || true; }
+# ntfy POST with headers: $1=priority $2=tags(emoji) $3=message body.
+_ntfy()  { [[ -n "$KDP_ALERT_WEBHOOK" ]] || return 0; curl -fsS -m 15 -H "Title: kdp-archive" -H "Priority: $1" -H "Tags: $2" --data-binary "kdp-archive: $3" "$KDP_ALERT_WEBHOOK" >/dev/null 2>&1 || true; }
+# Routine progress -> low priority (delivered silently, no buzz). Failures -> urgent + warning.
+notify() { log "$*";        _ntfy low    floppy_disk "$*"; }
+alert()  { log "ALERT: $*"; _ntfy urgent warning     "ALERT: $*"; }
 trap 'alert "unexpected abort at line $LINENO (no data deleted past this point)"' ERR
 
 command -v rclone >/dev/null || { alert "rclone not installed"; exit 1; }

@@ -1,7 +1,9 @@
 """Extract-on-demand for day tarballs (the all-2026 backfill shape).
 
-The index lists ``YYYY-MM-DD.tar.gz`` files lazily; this helper extracts a
-selection into ``dest/<day>/`` (tarfile's ``filter="data"`` guards against
+The index lists ``YYYY-MM-DD[.archive|.live].tar.gz`` files lazily; this
+helper extracts a selection into ``dest/<tar name>/`` — the full stem, so the
+two tiers of a cutoff-seam day land in separate dirs, never merged (tarfile's
+``filter="data"`` guards against
 path traversal; note it needs Python 3.11.4+, a hair above the declared
 ``>=3.11`` floor), skipping already-extracted days unless ``overwrite=True``.
 Re-index the returned dirs with ``DatasetIndex.build(dest)``.

@@ -30,7 +30,7 @@ is the data foundation for order-flow research.
 | **Browse** | `kdp-cli catalog` | What's on Kalshi, ranked by traded volume: categories → series → live markets; `--series` ends in a ready-to-run capture command. |
 | **Discover** | `kdp-cli discover` | Enumerate markets in a series / by status (find tickers to capture or backfill). |
 | **Process** | `kdp-process` | Raw JSONL → per-ticker columnar tables (lossless `book_events`, derived `book_top`, `trades`, `gaps`, + `manifest.json`). Parquet (default) or Feather. |
-| **Replay** | `kdp-load` (Rust lib) | Deterministic, time-ordered typed event stream over processed dirs: effective-timestamp merge, trade dedup, point-in-time book replay. |
+| **Replay** | `kdp-load` (Rust lib) | Deterministic, time-ordered typed event stream over processed dirs: effective-timestamp merge, trade dedup, point-in-time book replay. Runnable tour (no data needed): `cargo run -p kdp-load --example replay_tour`. |
 | **Analyze** | `python/` (kdp-data) | Dataset index + Polars loaders + `coverage()`/`holes()` trustworthiness reporting. See [python/README.md](python/README.md). |
 
 **New to the processed data?** Read the **[Data Guide](docs/data-guide.md)** — a

@@ -101,6 +101,22 @@ def test_day_tarballs_index_lazily(tmp_path):
     assert idx.tar_entries(date_range=(date(2026, 1, 6), date(2026, 1, 7))) == []
 
 
+def test_day_tarballs_match_backfill_tier_names(tmp_path):
+    # stream-backfill.sh emits <day>.<tier>.tar.gz (tier = archive|live); the
+    # cutoff-seam days carry BOTH tiers for one date. Other infixes stay ignored.
+    (tmp_path / "2026-03-30.archive.tar.gz").write_bytes(b"")
+    (tmp_path / "2026-03-30.live.tar.gz").write_bytes(b"")
+    (tmp_path / "2026-06-01.live.tar.gz").write_bytes(b"")
+    (tmp_path / "2026-06-01.backup.tar.gz").write_bytes(b"unknown infix ignored")
+    idx = DatasetIndex.build(tmp_path)
+    tars = idx.tar_entries()
+    assert [(t.date, t.path.name) for t in tars] == [
+        (date(2026, 3, 30), "2026-03-30.archive.tar.gz"),
+        (date(2026, 3, 30), "2026-03-30.live.tar.gz"),
+        (date(2026, 6, 1), "2026-06-01.live.tar.gz"),
+    ]
+
+
 def test_to_frame_has_one_row_per_entry():
     frame = DatasetIndex.build(FIXTURES).to_frame()
     assert isinstance(frame, pl.DataFrame)

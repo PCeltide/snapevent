@@ -1,7 +1,8 @@
 """Walk-on-demand dataset index over a kdp-processed tree.
 
 A directory containing ``manifest.json`` becomes an :class:`Entry`; a
-``YYYY-MM-DD.tar.gz`` day tarball (the all-2026 backfill shape) becomes a lazy
+``YYYY-MM-DD[.archive|.live].tar.gz`` day tarball (the all-2026 backfill
+shape — the backfill script suffixes its tier) becomes a lazy
 :class:`TarEntry` — listed, never opened, until
 :func:`kdp_data.tars.extract_day_tars`. No cache file: manifests are tiny and
 a full walk is sub-second, so the index is rebuilt per call (revisit only if a
@@ -25,7 +26,9 @@ SUPPORTED_SCHEMA_VERSION = 1
 
 _MONTHS = "JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC".split()
 _EVENT_DATE_RE = re.compile(r"-(\d{2})(" + "|".join(_MONTHS) + r")(\d{2})")
-_DAY_TAR_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.tar\.gz$")
+# Plain YYYY-MM-DD.tar.gz plus the tiered names stream-backfill.sh actually
+# emits (<day>.archive.tar.gz / <day>.live.tar.gz; seam days carry both).
+_DAY_TAR_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:\.(?:archive|live))?\.tar\.gz$")
 
 
 @dataclass(frozen=True)

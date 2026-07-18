@@ -332,6 +332,25 @@ never-drop backpressure, and a disk guard. The server adds the missing layer:
 alerts on: capture down, low disk, recent gap markers). Process-restart downtime
 is *not* auto-marked as a gap yet — a future enhancement.
 
+**Alert throttling (why you don't get spammed).** `kdp-health` runs on a frequent
+timer, so a *persistent* failure used to re-push an identical alert every tick —
+one stuck unit produced **186 identical pushes in 24 h**, which trains you to
+ignore the alert that matters. It now **logs every occurrence** but pushes each
+distinct subject at most once per `KDP_ALERT_THROTTLE_SEC` (default 1 h), with a
+single "recovered" all-clear on the first fully-clean run. Two things to know:
+
+- The dedup key **strips digits** — that's deliberate (a drifting metric like
+  `no new data for 200s` → `220s` would otherwise defeat dedup every tick). The
+  tradeoff: two subjects differing *only* in digits share a key, so two capture
+  sessions stale at once (`...JUL1416` / `...JUL1418`) alert once per window, not
+  twice. Distinct subjects (low disk vs. failed unit) always alert separately.
+- State lives in `KDP_ALERT_STATE_DIR` (`/var/lib/kdp/alert-state`), written by
+  the **kdp** user. `install.sh` creates it `kdp:kdp`. **If you ever run
+  `kdp-health.sh` manually as root**, the file it writes is root-owned and the
+  kdp-user timer can no longer update that key — throttling silently stops
+  working for it and the spam returns. Run it as `sudo -u kdp` instead, or
+  `chown -R kdp:kdp /var/lib/kdp/alert-state` after.
+
 ## Continuous mode (always-capturing a fixed market set)
 
 For ambient 24/7 capture (not per-event), run one long-lived

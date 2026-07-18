@@ -450,8 +450,15 @@ deterministic, time-ordered, TYPED event stream — snapshots grouped, integer
 units, gaps in-band, explicit WS/REST trade provenance, and `between(t0, t1)`
 with a synthetic opening book at `t0`. It owns the ordering rule this guide
 implies (WS rows by `recv_ts_us`; REST-backfilled trades by `event_ts_us` —
-never the backfill's fetch time), so consumers don't re-derive it. Full
-contract: `docs/plans/2026-07-06-kdp-load-design.md`.
+never the backfill's fetch time), so consumers don't re-derive it. Try it
+against the committed fixture, no data needed:
+`cargo run -p kdp-load --example replay_tour` (open → verdict → stream counts
+→ full-depth ladder at an instant). One caveat worth knowing: REST `verify`
+observations are not replay events, so on a settled market the stream's last
+timestamp can trail the manifest's `last_recv_ts_us` by up to one verify
+interval — take "capture end" from the manifest, never from
+`events().last()`. Full contract: the crate rustdoc
+(`cargo doc -p kdp-load --open`).
 
 **Loading it back (Python): `kdp-data`.** For tabular analysis (Polars), the
 `python/` package indexes any local tree of processed dirs
