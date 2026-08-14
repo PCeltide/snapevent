@@ -5,8 +5,9 @@ Dataset index + Polars tabular loaders for kdp-processed Kalshi market data
 `docs/data-guide.md` at the repo root).
 
 Tabular reads only: deterministic ordering, trade dedup, and book replay live
-in the Rust `kdp-load` crate (pyo3 bindings planned). A trades frame from a
-directory holding both WS and REST copies of a print contains both rows.
+in the Rust `kdp-load` crate — usable from Python via the `kdp_load`
+bindings (see "Full-depth replay" below). A trades frame from a directory
+holding both WS and REST copies of a print contains both rows.
 
 ## Install
 
@@ -54,6 +55,27 @@ Rollups are one `group_by` away:
     cov.group_by("date").agg(pl.mean("uptime"), pl.sum("hole_us"))
 
 Example: `uv run python examples/btc_hourly_book_top.py --root <tree>`.
+
+## Full-depth replay — `kdp_load` (compiled bindings)
+
+`crates/kdp-load-py` wraps the canonical Rust replay in a Python module
+(pyo3/maturin, needs a Rust toolchain to build). From the repo root:
+
+    powershell -File scripts/check-load-py.ps1   # maturin develop into .venv + smoke
+
+    from kdp_load import Loader, IncompleteData
+
+    ld = Loader(path)                    # R3 gate, like the loaders above
+    for ev in ld.events(): ...           # merged time-ordered dicts, integer units
+    for ev in ld.between(t0_us, t1_us): ...  # synthetic opener first
+    ld.book_at(t_us)                     # the FULL ladder at one instant:
+                                         # {"yes": [(price_micro, qty_centi)...],
+                                         #  "no": [...], "suspect_gaps": [...]}
+
+Non-empty `suspect_gaps` means a capture hole since the last re-anchoring
+snapshot — treat that ladder with suspicion. Worked example:
+`uv run python examples/full_depth_replay.py` (runs against the committed
+fixture, no data needed).
 
 Dev: `uv run pytest` / `uv run ruff check .` (or `powershell -File
 ../scripts/check-py.ps1` from python/, `scripts/check-py.ps1` from the repo

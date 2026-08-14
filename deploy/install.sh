@@ -22,7 +22,13 @@ install -d -o kdp -g kdp /opt/kdp/bin /var/lib/kdp /var/lib/kdp/data /var/lib/kd
 # Alert throttle state (kdp-health runs as kdp; a root-owned dir here would make
 # every throttle write fail silently and restore the push spam it prevents).
 install -d -o kdp -g kdp /var/lib/kdp/alert-state
+# Per-session checkpoint locks (kdp-archive.sh vs kdp-checkpoint.sh). Same
+# ownership trap as alert-state: a root-owned dir here -- from kdp-archive.sh
+# run once under sudo -- would make the kdp-user checkpoint fail to open its
+# lock file and exit, silently dropping every daily raw checkpoint.
+install -d -o kdp -g kdp /var/lib/kdp/data/.locks
 install -d -m 750 -o kdp -g kdp /etc/kdp /etc/kdp/sessions /etc/kdp/schedules
+install -d -m 750 -o kdp -g kdp /etc/kdp/universes
 install -d -m 700 -o kdp -g kdp /home/kdp/.config /home/kdp/.config/rclone
 
 say "binaries"
@@ -36,7 +42,7 @@ fi
 say "scripts + systemd units"
 install -o kdp -g kdp -m 755 \
   "$REPO/deploy/kdp-archive.sh" "$REPO/deploy/kdp-health.sh" "$REPO/deploy/kdp-settlewatch.sh" \
-  "$REPO/deploy/kdp-rawsync.sh" \
+  "$REPO/deploy/kdp-rawsync.sh" "$REPO/deploy/kdp-checkpoint.sh" "$REPO/deploy/kdp-digest.sh" \
   /opt/kdp/bin/
 install -m 644 \
   "$REPO/deploy/kdp-capture@.service" \
@@ -45,6 +51,8 @@ install -m 644 \
   "$REPO/deploy/kdp-rawsync@.service" "$REPO/deploy/kdp-rawsync@.timer" \
   "$REPO/deploy/kdp-hourly.service" \
   "$REPO/deploy/kdp-scheduled.service" \
+  "$REPO/deploy/kdp-universe@.service" \
+  "$REPO/deploy/kdp-digest.service" "$REPO/deploy/kdp-digest.timer" \
   /etc/systemd/system/
 
 say "schedule files"
@@ -62,6 +70,11 @@ if compgen -G "$REPO/deploy/schedules/*.jsonl" >/dev/null; then
   done
 fi
 
+say "universe config example"
+if [[ ! -f /etc/kdp/universes/crypto.env.example ]]; then
+  install -o kdp -g kdp -m 640 "$REPO/deploy/universes/crypto.env.example" /etc/kdp/universes/
+fi
+
 say "config + ntp + firewall"
 if [[ ! -f /etc/kdp/kdp.env ]]; then
   install -o kdp -g kdp -m 600 "$REPO/deploy/kdp.env.example" /etc/kdp/kdp.env
@@ -72,7 +85,7 @@ ufw allow OpenSSH >/dev/null 2>&1 || true
 ufw --force enable >/dev/null 2>&1 || true
 
 systemctl daemon-reload
-systemctl enable --now kdp-archive.timer kdp-health.timer || true
+systemctl enable --now kdp-archive.timer kdp-health.timer kdp-digest.timer || true
 
 # --- report what secrets are still missing (NOT in git) -------------------
 say "remaining manual steps (sensitive — migrate these, never commit):"
@@ -102,5 +115,6 @@ unit_note() {  # $1 = unit, $2 = hint to print only when it's disabled
 }
 unit_note kdp-hourly.service    "Start forward hourly capture with: systemctl enable --now kdp-hourly"
 unit_note kdp-scheduled.service "Set KDP_SCHEDULE_FILE in kdp.env, then: systemctl enable --now kdp-scheduled"
+unit_note kdp-universe@crypto.service "Copy crypto.env.example to crypto.env, edit it, then: systemctl start kdp-universe@crypto"
 echo
 echo "done."

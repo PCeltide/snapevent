@@ -39,3 +39,20 @@ jobs:
       - name: Gate (ruff + pytest)
         run: ./scripts/check-py.ps1
         shell: pwsh
+
+  load-py:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/kdp-load-py
+      - uses: astral-sh/setup-uv@v5
+      - name: Gate (maturin develop + pytest)
+        run: ./scripts/check-load-py.ps1
+        shell: pwsh

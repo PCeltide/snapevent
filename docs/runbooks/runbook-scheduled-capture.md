@@ -74,8 +74,8 @@ The JSONL is the stable contract; per-tournament CSV converters are throwaway
 ```powershell
 pwsh -File scripts/schedule-from-csv.ps1 `
   -Csv "<source>.csv" -Series KXCUPMATCH `
-  -RemotePrefix remote:kdp/cup-2026 -IdPrefix cup `
-  -Out deploy/schedules/cup-2026.jsonl
+  -RemotePrefix remote:kdp/my-cup -IdPrefix cup `
+  -Out deploy/schedules/my-cup.jsonl
 ```
 
 It derives team codes from the team names, uses the CSV's `kalshi_market_code`

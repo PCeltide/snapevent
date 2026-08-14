@@ -1,0 +1,11 @@
+# kdp-digest.service
+[Unit]
+Description=kdp nightly capture-health digest (ntfy)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=kdp
+Group=kdp
+EnvironmentFile=/etc/kdp/kdp.env
+ExecStart=/opt/kdp/bin/kdp-digest.sh

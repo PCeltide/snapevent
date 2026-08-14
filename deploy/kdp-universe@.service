@@ -1,0 +1,45 @@
+# kdp capture-universe supervisor, one instance per universe.
+#   systemctl start kdp-universe@crypto     (reads /etc/kdp/universes/crypto.env)
+#
+# Restart=on-failure (NOT always): the supervisor exits 0 ONLY on
+# bound-reached (--until/--for) or explicit shutdown -- both legitimate ends.
+# Any other termination is nonzero and restarts. See runbook-universe.md.
+#
+# Note: systemd kills the cgroup on stop, including a just-spawned archive
+# child; the kdp-archive.timer sweep re-archives any session left .done
+# without .archived (the existing recovery path). The sweep reads the
+# session's .remote-prefix marker (written by the supervisor at unit start),
+# so a recovered session still lands under universe-<name>/ and its
+# raw-inflight checkpoints are still purged.
+[Unit]
+Description=kdp capture-universe supervisor (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+# One JSONL file stays open per (ticker, channel) for the life of a capture
+# unit, and at an hourly seam TWO cohorts are open at once -- so peak fd use is
+# ~4x the ticker count. systemd's default soft limit is 1024, which a
+# breadth capture blows through (observed 2026-08-01: capture-universe over
+# KXETHD+KXBTC halted mid-run with "Too many open files (os error 24)").
+# Capture is unrecoverable (ADR-003), so give it headroom it cannot reach.
+LimitNOFILE=65536
+Type=simple
+User=kdp
+Group=kdp
+EnvironmentFile=/etc/kdp/kdp.env
+EnvironmentFile=/etc/kdp/universes/%i.env
+ExecStart=/opt/kdp/bin/kdp-cli capture-universe \
+  --series ${KDP_UNIVERSE_SERIES} --name %i \
+  --out ${KDP_DATA_DIR} --grace ${KDP_SETTLE_GRACE} --poll ${KDP_SETTLE_POLL} \
+  --archive-cmd /opt/kdp/bin/kdp-archive.sh \
+  --checkpoint-cmd /opt/kdp/bin/kdp-checkpoint.sh \
+  $KDP_UNIVERSE_EXTRA
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

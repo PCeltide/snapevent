@@ -20,7 +20,7 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 use kdp_kalshi::auth::KalshiCredentials;
-use kdp_kalshi::rest::{list_markets_page, Market};
+use kdp_kalshi::rest::{list_markets_by_event, Market};
 
 use crate::capture::capture_session;
 
@@ -46,6 +46,17 @@ pub fn all_settled(target: &[String], latest: &[Market]) -> bool {
     })
 }
 
+/// Seconds from `now` to the next UTC midnight (exactly 86400 at midnight).
+pub(crate) fn secs_to_next_utc_midnight(now: chrono::DateTime<chrono::Utc>) -> u64 {
+    let next = (now.date_naive() + chrono::Days::new(1))
+        .and_hms_opt(0, 0, 0)
+        .map(|n| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(n, chrono::Utc));
+    match next {
+        Some(n) => (n - now).num_seconds().max(1) as u64,
+        None => 86_400, // unreachable in practice; a sane fallback beats a panic
+    }
+}
+
 /// One unit of capture: a resolved target market set plus the metadata the spine
 /// needs to capture it, watch for its settlement, and archive it. Built by each
 /// command's resolver (hourly's band selection / the scheduler's hybrid resolve).
@@ -56,8 +67,14 @@ pub struct CaptureUnit {
     pub session: String,
     /// The markets to capture (e.g. a strike band, or both sides of a match).
     pub tickers: Vec<String>,
-    /// Series ticker, for the settlement poll's `series` filter.
-    pub series: String,
+    /// The Kalshi **event ticker** this unit captures — the settlement poll's
+    /// scope (`GET /markets?event_ticker=…`). Must be a real API event ticker,
+    /// not a display name: the poll matches the response against `tickers`, and
+    /// a wrong value returns an empty page, whose targets are all "absent" and
+    /// therefore conservatively not-terminal, so the unit would run to its
+    /// backstop. Usually equal to `session`, but they are different contracts —
+    /// `session` names a directory, this names an API resource.
+    pub event: String,
     /// Optional Drive-namespace override passed to the archive script as its 2nd
     /// arg (`None` = the archive script's own `KDP_RCLONE_REMOTE` default).
     pub remote_prefix: Option<String>,
@@ -78,8 +95,67 @@ pub struct UnitCfg {
     pub max_secs: u64,
     /// Path to kdp-archive.sh (empty = skip archive, for dev/capture-only).
     pub archive_cmd: String,
+    /// Daily raw checkpoint command (empty = disabled). Spawned in the
+    /// background just after each UTC day rotation for units still alive,
+    /// with the same args as archive_cmd (session, then remote_prefix when
+    /// set). A failed checkpoint alerts but never touches capture.
+    pub checkpoint_cmd: String,
     /// Periodic REST verify-sweep interval (seconds); `0` disables it.
     pub verify_interval_secs: u64,
+}
+
+/// One settlement poll's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollOutcome {
+    /// Every target is terminal and the whole target set was visible.
+    Settled,
+    /// At least one target is live, absent, or the page was truncated.
+    NotSettled,
+    /// The fetch itself failed; nothing was learned. Retry.
+    Failed,
+}
+
+/// Decide, from one settlement poll, whether the unit is done.
+///
+/// Split out of the watcher loop and generic over the fetch so a test can drive
+/// the real decision path against a fixture that models Kalshi's paging. The
+/// bug this replaces (2026-08-08) was never in `all_settled` — it was in WHICH
+/// markets the poll asked for, and nothing tested that. `fetch` takes the event
+/// ticker by value so the closure can be `move`-free at the call site.
+///
+/// A truncated page (cursor present) is NOT settled: with part of the target
+/// set invisible, "all terminal" cannot be honestly concluded. It also warns,
+/// because silently running to the backstop is how the original bug hid for
+/// months.
+pub(crate) async fn poll_once<F, Fut>(fetch: F, event: &str, target: &[String]) -> PollOutcome
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(Vec<Market>, Option<String>)>>,
+{
+    match fetch(event.to_string()).await {
+        Err(e) => {
+            warn!(event = %event, error = %e, "settlement poll failed; will retry");
+            PollOutcome::Failed
+        }
+        Ok((_, Some(_))) => {
+            warn!(
+                event = %event, targets = target.len(),
+                "settlement poll page was truncated; cannot see the whole cohort, so \
+                 settlement can never be detected -- this unit will run to its backstop"
+            );
+            PollOutcome::NotSettled
+        }
+        Ok((m, None)) if m.is_empty() => {
+            warn!(
+                event = %event, targets = target.len(),
+                "settlement poll returned zero markets for this event ticker; the poll scope is \
+                 probably wrong -- this unit can never settle and will run to its backstop"
+            );
+            PollOutcome::NotSettled
+        }
+        Ok((markets, None)) if all_settled(target, &markets) => PollOutcome::Settled,
+        Ok(_) => PollOutcome::NotSettled,
+    }
 }
 
 /// Run one unit end-to-end: capture `unit.tickers` into `data_dir/<session>`
@@ -104,21 +180,41 @@ pub async fn run_capture_unit(
     let base_dir = format!("{}/{}", cfg.data_dir, unit.session);
     let stop = Arc::new(Notify::new());
 
-    // Settlement watcher: poll /markets filtered by SERIES ONLY, match targets by
-    // ticker, stop when all are terminal (+grace) or the backstop fires. This
-    // mirrors the proven `kdp-settlewatch.sh` exactly. Do NOT window the poll on
-    // `close_time`: Kalshi REWRITES close_time on settlement (a pre-settle +2-day
-    // hard-close jumps to the real close, e.g. 06-14 -> 06-12 21:12Z), so any
-    // close_time window built at resolve time would filter the settled markets
-    // OUT of the response -> all_settled never sees them terminal -> capture runs
-    // to the backstop and never archives. (This bit the first scheduled go-live; the hourly
-    // path shared the same window but escaped only because KXBTCD close_time is
-    // stable.) The series filter scopes the result; absent targets count as
-    // not-terminal (conservative), so a truncated page can never stop us early.
+    // Persist the Drive-namespace prefix where the OUT-OF-PROCESS recovery
+    // paths can find it: the nightly kdp-archive.sh sweep (and a manual
+    // no-prefix invocation) read `.remote-prefix` before falling back to the
+    // bare env remote. Without it, a sweep-recovered prefixed session uploads
+    // outside its namespace and its raw-inflight checkpoints are never purged
+    // (review I-2). Written at unit START so it survives every death mode.
+    if let Some(prefix) = &unit.remote_prefix {
+        let write = std::fs::create_dir_all(&base_dir)
+            .and_then(|()| std::fs::write(format!("{base_dir}/.remote-prefix"), prefix));
+        if let Err(e) = write {
+            warn!(session = %unit.session, error = %e,
+                "could not write .remote-prefix marker; a sweep-recovered archive would fall back to the bare remote");
+        }
+    }
+
+    // Settlement watcher: poll `/markets?event_ticker=<event>` and stop when
+    // every target is terminal (+grace) or the backstop fires.
+    //
+    // Scoped to the EVENT, never the series (2026-08-08 post-mortem). A cohort
+    // IS an event, so the response is exactly the target set and the
+    // conservative "absent => not terminal" rule in `all_settled` is safe. The
+    // previous series-scoped poll read one 1000-row page and discarded the
+    // cursor; a cohort's targets were essentially never in that page, so
+    // `all_settled` returned false forever and EVERY unit ran to its backstop
+    // -- 0 settlements across two supervisors, 164 cohorts permanently lost
+    // (ADR-003) in one 7-day soak.
+    //
+    // Also, still: never window this poll on `close_time`. Kalshi rewrites
+    // close_time on settlement (a pre-settle +2-day hard-close jumps to the
+    // real close), so a resolve-time window filters the settled markets out
+    // (2026-06-12 post-mortem). The event filter is stable; close_time is not.
     let watcher = {
         let stop = stop.clone();
         let client = client.clone();
-        let series = unit.series.clone();
+        let event = unit.event.clone();
         let target = unit.tickers.clone();
         let (poll, grace, max_secs) = (cfg.poll_secs, cfg.grace_secs, cfg.max_secs);
         tokio::spawn(async move {
@@ -128,23 +224,63 @@ pub async fn run_capture_unit(
                     warn!("unit backstop reached; stopping capture");
                     break;
                 }
-                match list_markets_page(&client, 1000, None, Some(&series), None, None, None).await
-                {
-                    Ok((markets, _)) if all_settled(&target, &markets) => {
-                        info!(
-                            grace_s = grace,
-                            "unit settled; capturing grace then stopping"
-                        );
-                        time::sleep(Duration::from_secs(grace)).await;
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "settlement poll failed; will retry"),
+                let outcome = poll_once(
+                    |ev| {
+                        let client = client.clone();
+                        async move {
+                            list_markets_by_event(&client, &ev, 1000)
+                                .await
+                                .map_err(anyhow::Error::from)
+                        }
+                    },
+                    &event,
+                    &target,
+                )
+                .await;
+                if outcome == PollOutcome::Settled {
+                    info!(
+                        grace_s = grace,
+                        "unit settled; capturing grace then stopping"
+                    );
+                    time::sleep(Duration::from_secs(grace)).await;
+                    break;
                 }
                 time::sleep(Duration::from_secs(poll)).await;
             }
             stop.notify_one();
         })
+    };
+
+    // Daily raw checkpoint: fires ~60s after each UTC day rotation for units
+    // still alive at that point (hourly units never live past one midnight, so
+    // this is a no-op for them). Same spawn idiom as the archive below.
+    let checkpoint = if cfg.checkpoint_cmd.is_empty() {
+        None
+    } else {
+        let cmd = cfg.checkpoint_cmd.clone();
+        let session = unit.session.clone();
+        let prefix = unit.remote_prefix.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                let wait = secs_to_next_utc_midnight(chrono::Utc::now()) + 60;
+                time::sleep(Duration::from_secs(wait)).await;
+                let mut command = std::process::Command::new(&cmd);
+                command.arg(&session);
+                if let Some(p) = &prefix {
+                    command.arg(p);
+                }
+                match command.spawn() {
+                    Ok(mut child) => {
+                        info!(session = %session, "background raw checkpoint spawned");
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(e) => error!(session = %session, error = %e,
+                        "could not spawn checkpoint; raw remains local-only until archive"),
+                }
+            }
+        }))
     };
 
     // Stop capture on settlement (the watcher) OR a process-wide shutdown signal
@@ -177,6 +313,9 @@ pub async fn run_capture_unit(
         Err(e) => error!(session = %unit.session, error = %e, "unit capture error"),
     }
     watcher.abort();
+    if let Some(h) = checkpoint {
+        h.abort();
+    }
 
     // Mark the session done so the nightly archive sweep picks it up even if the
     // inline archive below is interrupted (e.g. a shutdown killing the spawned child).
@@ -333,6 +472,23 @@ mod tests {
             .expect("park task must not panic");
     }
 
+    #[test]
+    fn secs_to_next_utc_midnight_counts_down_and_wraps() {
+        let t = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        assert_eq!(
+            secs_to_next_utc_midnight(t("2026-08-01T23:59:00+00:00")),
+            60
+        );
+        assert_eq!(
+            secs_to_next_utc_midnight(t("2026-08-01T00:00:00+00:00")),
+            86_400
+        );
+        assert_eq!(
+            secs_to_next_utc_midnight(t("2026-08-01T12:00:00+00:00")),
+            43_200
+        );
+    }
+
     fn mk(ticker: &str, status: &str) -> Market {
         Market {
             ticker: kdp_core::Ticker(ticker.into()),
@@ -375,6 +531,156 @@ mod tests {
         let b_settled = mk("B", "settled");
         assert!(all_settled(&target, &[a.clone(), b_settled]));
         assert!(!all_settled(&target, &[a]), "B absent -> not settled");
+    }
+
+    fn mk_ev(ticker: &str, event: &str, status: &str) -> Market {
+        let mut m = mk(ticker, status);
+        m.event_ticker = Some(event.to_string());
+        m
+    }
+
+    /// A fake venue that models Kalshi's real paging: many events, far more
+    /// than one page of markets in the series, and a cursor when a query
+    /// overflows `limit`. `seen` records every event actually asked for, so a
+    /// regression to series-wide polling fails loudly instead of silently.
+    struct Venue {
+        markets: Vec<Market>,
+        limit: usize,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Venue {
+        /// 60 events x 200 markets = 12,000 markets in one series. `TARGET` is
+        /// the LAST event by ticker order, so it is nowhere near the first
+        /// 1000-row page a series-scoped listing would return -- the exact
+        /// production shape (measured: KXBTC/KXETHD carry 6,848 / 10,840
+        /// unopened plus ~1,000 settled markets each).
+        fn new(target_status: &str) -> Self {
+            let mut markets = Vec::new();
+            for ev in 0..60 {
+                let event = format!("KXTEST-26AUG{ev:04}");
+                let status = if event == Self::TARGET {
+                    target_status
+                } else {
+                    "active"
+                };
+                for k in 0..200 {
+                    markets.push(mk_ev(&format!("{event}-T{k}"), &event, status));
+                }
+            }
+            Venue {
+                markets,
+                limit: 1000,
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        const TARGET: &'static str = "KXTEST-26AUG0059";
+
+        fn targets() -> Vec<String> {
+            (0..200).map(|k| format!("{}-T{k}", Self::TARGET)).collect()
+        }
+
+        /// What a series-scoped poll saw: the first `limit` rows of the series.
+        fn series_first_page(&self) -> Vec<Market> {
+            self.markets.iter().take(self.limit).cloned().collect()
+        }
+
+        async fn event_page(&self, event: String) -> anyhow::Result<(Vec<Market>, Option<String>)> {
+            if let Ok(mut s) = self.seen.lock() {
+                s.push(event.clone());
+            }
+            let hits: Vec<Market> = self
+                .markets
+                .iter()
+                .filter(|m| m.event_ticker.as_deref() == Some(event.as_str()))
+                .cloned()
+                .collect();
+            let next = (hits.len() > self.limit).then(|| "more".to_string());
+            Ok((hits.into_iter().take(self.limit).collect(), next))
+        }
+    }
+
+    #[test]
+    fn the_series_scoped_page_never_contained_the_targets() {
+        // The 2026-08-08 post-mortem, encoded. This is not a test of new code;
+        // it is the fixture's proof that the OLD poll could not work, so the
+        // tests below are testing something real. 172 cohorts armed, 0 ever
+        // settled, 164 permanently lost (ADR-003).
+        let venue = Venue::new("finalized");
+        let page = venue.series_first_page();
+        let target = Venue::targets();
+        assert_eq!(page.len(), 1000, "the series page truncates");
+        assert!(
+            !all_settled(&target, &page),
+            "the targets are absent from the series page, so the unit can NEVER settle"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_detects_settlement_of_an_event_buried_past_the_first_page() {
+        let venue = Venue::new("finalized");
+        let out = poll_once(|ev| venue.event_page(ev), Venue::TARGET, &Venue::targets()).await;
+        assert_eq!(out, PollOutcome::Settled);
+        assert_eq!(
+            *venue.seen.lock().expect("seen"),
+            vec![Venue::TARGET.to_string()],
+            "the poll must scope to the unit's EVENT, never to its series"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_keeps_capturing_while_any_target_is_active() {
+        let venue = Venue::new("active");
+        let out = poll_once(|ev| venue.event_page(ev), Venue::TARGET, &Venue::targets()).await;
+        assert_eq!(out, PollOutcome::NotSettled);
+    }
+
+    #[tokio::test]
+    async fn poll_keeps_capturing_a_cohort_that_has_not_opened_yet() {
+        // The D1 x D2 interaction guard. Pre-open arming (Task 3) arms a unit
+        // up to --arm-lead-min before its markets open, when they report
+        // `initialized`. That is not terminal, so the unit must keep capturing
+        // -- if this ever returned Settled the whole cohort would be dropped
+        // at t-30min, every hour, silently.
+        let venue = Venue::new("initialized");
+        let out = poll_once(|ev| venue.event_page(ev), Venue::TARGET, &Venue::targets()).await;
+        assert_eq!(out, PollOutcome::NotSettled);
+    }
+
+    #[tokio::test]
+    async fn poll_refuses_to_conclude_settled_from_a_truncated_page() {
+        // An event bigger than one page means we cannot see every target, which
+        // is the failure class this whole change exists to close. Never settle
+        // on partial data; the backstop remains the honest bound.
+        let mut venue = Venue::new("finalized");
+        venue.limit = 50;
+        let out = poll_once(|ev| venue.event_page(ev), Venue::TARGET, &Venue::targets()).await;
+        assert_eq!(out, PollOutcome::NotSettled);
+    }
+
+    #[tokio::test]
+    async fn poll_does_not_settle_when_the_event_ticker_matches_nothing() {
+        // Real trigger: a CaptureUnit.event that is not a real API event ticker.
+        // scheduled.rs's session_name() falls back to entry.id when a matched
+        // ticker doesn't split on '-' and no event_ticker was read -- that id
+        // (e.g. "wt20-sco-eng") is never a real event ticker, so the poll
+        // returns zero markets every time. Without this arm that degrades
+        // silently into NotSettled and the unit just rides the backstop.
+        let venue = Venue::new("finalized");
+        let out = poll_once(|ev| venue.event_page(ev), "wt20-sco-eng", &Venue::targets()).await;
+        assert_eq!(out, PollOutcome::NotSettled);
+    }
+
+    #[tokio::test]
+    async fn poll_reports_failure_without_settling_when_the_fetch_errors() {
+        let out = poll_once(
+            |_ev| async { Err(anyhow::anyhow!("503 from the venue")) },
+            "KXTEST-26AUG0059",
+            &Venue::targets(),
+        )
+        .await;
+        assert_eq!(out, PollOutcome::Failed);
     }
 
     #[test]

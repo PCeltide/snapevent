@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kdp-load"
+description = "Python bindings for kdp-load: deterministic full-depth replay over kdp-processed market data"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.11"
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["extension-module"]
+module-name = "kdp_load"

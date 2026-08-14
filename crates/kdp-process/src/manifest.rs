@@ -106,6 +106,17 @@ pub struct Manifest {
     /// a level strictly below zero (a consistency signal, distinct from
     /// verification).
     pub underflows: u64,
+    /// Observed capture span in microseconds: the `book_events` `recv_ts_us`
+    /// extent, falling back to the trades `event_ts_us` extent when the
+    /// directory has no book events; null when it has neither. Additive
+    /// (since v0.3.0) -- absent in older manifests, so treat missing as unknown.
+    pub span_us: Option<i64>,
+    /// Unioned, span-clamped hole time from the gaps table -- the same rule as
+    /// kdp-data `coverage()`: a hole opens at each gap and closes at the first
+    /// snapshot at-or-after it (or at the span end when nothing re-anchors).
+    /// Null unless book events exist, so a trades-only directory never fakes a
+    /// 0. Uptime = `1 - hole_us / span_us`.
+    pub hole_us: Option<i64>,
 }
 
 impl Manifest {
@@ -162,12 +173,18 @@ mod tests {
             verify_mismatches: 0,
             verify_skipped: 0,
             underflows: 0,
+            span_us: None,
+            hole_us: None,
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(back["complete"], true);
         assert_eq!(back["counts"]["book_events"], 50);
         assert_eq!(back["ticker"], "K");
+        // Absent coverage is an explicit JSON null, never a fake 0 -- consumers
+        // must be able to tell "no book/trade span" from "zero-length span".
+        assert!(back["span_us"].is_null());
+        assert!(back["hole_us"].is_null());
     }
 
     #[test]

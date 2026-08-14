@@ -238,6 +238,7 @@ impl HourCfg {
             poll_secs: self.poll_secs,
             max_secs: self.max_hours.saturating_mul(3600),
             archive_cmd: self.archive_cmd.clone(),
+            checkpoint_cmd: String::new(),
             verify_interval_secs: self.verify_interval_secs,
         }
     }
@@ -250,7 +251,6 @@ impl HourCfg {
 async fn run_one_hour(
     creds: Arc<KalshiCredentials>,
     client: &reqwest::Client,
-    series: &str,
     event_ticker: &str,
     tickers: Vec<String>,
     cfg: &HourCfg,
@@ -259,7 +259,7 @@ async fn run_one_hour(
     let unit = CaptureUnit {
         session: event_ticker.to_string(),
         tickers,
-        series: series.to_string(),
+        event: event_ticker.to_string(),
         remote_prefix: None,
     };
     run_capture_unit(creds, client, &unit, &cfg.unit_cfg(), shutdown_rx).await;
@@ -478,12 +478,11 @@ pub async fn run_hourly(args: &crate::args::Args) -> anyhow::Result<()> {
         }
         let creds2 = Arc::clone(&creds);
         let client2 = client.clone();
-        let series2 = series.clone();
         let cfg2 = cfg.clone();
         let ev = event_ticker.clone();
         let srx = shutdown_rx.clone();
         inflight.push(tokio::spawn(async move {
-            run_one_hour(creds2, &client2, &series2, &ev, tickers, &cfg2, srx).await;
+            run_one_hour(creds2, &client2, &ev, tickers, &cfg2, srx).await;
         }));
         if wait_past_or_shutdown(boundary, &shutdown_rx).await {
             break;

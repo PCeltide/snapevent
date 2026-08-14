@@ -38,6 +38,12 @@ pub struct TickerOutcome {
     pub complete: bool,
 }
 
+/// Fold `v` into a running `[lo, hi]` extent (both start `None`).
+fn extend(lo: &mut Option<i64>, hi: &mut Option<i64>, v: i64) {
+    *lo = Some(lo.map_or(v, |m| m.min(v)));
+    *hi = Some(hi.map_or(v, |m| m.max(v)));
+}
+
 /// List `*.jsonl` files in `dir`, sorted (date filenames sort chronologically).
 /// A missing directory yields an empty list (that channel simply wasn't captured).
 fn jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -77,6 +83,75 @@ pub fn discover_tickers(in_dir: &Path) -> Result<Vec<String>> {
     }
     tickers.sort();
     Ok(tickers)
+}
+
+/// Coverage accounting for one ticker: `(span_us, hole_us)`, both microseconds.
+///
+/// A port of kdp-data's `coverage()` (`python/src/kdp_data/coverage.py`) so the
+/// manifest and the Python accounting can never disagree about the same
+/// directory:
+/// - span = the `book_events` `recv_ts_us` extent; a directory with no book
+///   events falls back to the trades `event_ts_us` extent; neither -> `None`.
+/// - `hole_us` is computed ONLY when book events exist (uptime is an L2-capture
+///   concept), so a trades-only directory reports `None`, never a fake 0.
+/// - each gap opens a hole that closes at the first snapshot at-or-after it; a
+///   gap nothing re-anchors still holes to the span end, and is dropped only
+///   when the gap opened past it (a capture that died inside the hole is
+///   unmeasurable, never a negative window). Windows are clamped to the span,
+///   zero/negative-width ones dropped, then unioned (overlaps merged) and summed.
+fn coverage(
+    gap_rows: &[(Envelope, GapMarker)],
+    mut snap_ts_us: Vec<i64>,
+    book: (Option<i64>, Option<i64>),
+    trade: (Option<i64>, Option<i64>),
+) -> (Option<i64>, Option<i64>) {
+    snap_ts_us.sort_unstable();
+    snap_ts_us.dedup();
+    let (span_start, span_end) = if book.0.is_some() { book } else { trade };
+    let span_us = match (span_start, span_end) {
+        (Some(a), Some(b)) => Some(b - a),
+        _ => None,
+    };
+    // The Python's `has_book` (a non-empty book_events table) is exactly "we saw
+    // a book extent"; without one there is no honest hole figure. A `let ... else`
+    // rather than an assertion: the invariant holds, but it must not panic if it
+    // ever stops holding.
+    let (Some(ss), Some(se)) = (book.0, book.1) else {
+        return (span_us, None);
+    };
+
+    let mut windows: Vec<(i64, i64)> = Vec::new();
+    for (env, _) in gap_rows {
+        let start = env.recv_ts.0.timestamp_micros();
+        // `partition_point` is bisect_left: the first snapshot at-or-after the
+        // gap re-anchors the book and closes the hole.
+        let end = match snap_ts_us.get(snap_ts_us.partition_point(|t| *t < start)) {
+            Some(t) => *t,
+            None if se >= start => se,
+            None => continue,
+        };
+        let (cs, ce) = (start.max(ss), end.min(se));
+        if ce > cs {
+            windows.push((cs, ce));
+        }
+    }
+    windows.sort_unstable();
+    let mut total = 0i64;
+    let mut cur: Option<(i64, i64)> = None;
+    for (s, e) in windows {
+        cur = match cur {
+            Some((cs, ce)) if s <= ce => Some((cs, ce.max(e))),
+            Some((cs, ce)) => {
+                total += ce - cs;
+                Some((s, e))
+            }
+            None => Some((s, e)),
+        };
+    }
+    if let Some((cs, ce)) = cur {
+        total += ce - cs;
+    }
+    (span_us, Some(total))
 }
 
 /// Process one ticker end-to-end. Returns `None` (with a warning) if the ticker
@@ -119,6 +194,17 @@ pub fn process_ticker(
     let mut last_recv: Option<i64> = None;
     let mut source_files: Vec<SourceFile> = Vec::new();
     let mut two_sided_snapshots: usize = 0;
+    // Coverage accounting, mirroring what kdp-data `coverage()` reads back off
+    // the Parquet: the book_events recv_ts extent, the trades event_ts extent
+    // (the fallback span for a trades-only dir), and every snapshot recv_ts (the
+    // instants a hole can close at). Both snapshot and delta records always emit
+    // at least one book_events row -- an empty snapshot emits a boundary marker
+    // that is still `is_snapshot` -- so these extents match the table exactly.
+    let mut book_first_us: Option<i64> = None;
+    let mut book_last_us: Option<i64> = None;
+    let mut trade_first_us: Option<i64> = None;
+    let mut trade_last_us: Option<i64> = None;
+    let mut snap_ts_us: Vec<i64> = Vec::new();
 
     for (channel, files) in [("orderbook", &orderbook_files), ("trade", &trade_files)] {
         for path in files {
@@ -145,6 +231,8 @@ pub fn process_ticker(
                         let idx = event_idx;
                         event_idx += 1;
                         book_events.push_snapshot(idx, &env, s)?;
+                        extend(&mut book_first_us, &mut book_last_us, recv);
+                        snap_ts_us.push(recv);
                         book.apply_snapshot(s);
                         engine.on_book_event(recv, &book, true);
                         let evt = s.ts.0.timestamp_micros();
@@ -158,6 +246,7 @@ pub fn process_ticker(
                         let idx = event_idx;
                         event_idx += 1;
                         book_events.push_delta(idx, &env, d);
+                        extend(&mut book_first_us, &mut book_last_us, recv);
                         book.apply_delta(d);
                         engine.on_book_event(recv, &book, false);
                         let evt = d.ts.0.timestamp_micros();
@@ -167,7 +256,17 @@ pub fn process_ticker(
                         }
                         book_top.push(idx, &env, evt, "delta", &top);
                     }
-                    RecordKind::Trade(t) => trades.push(&env, t)?,
+                    RecordKind::Trade(t) => {
+                        trades.push(&env, t)?;
+                        // The same value the trades table's `event_ts_us`
+                        // column gets -- coverage()'s trades-only span reads
+                        // that column, not recv_ts.
+                        extend(
+                            &mut trade_first_us,
+                            &mut trade_last_us,
+                            t.ts.0.timestamp_micros(),
+                        );
+                    }
                     RecordKind::Gap(g) => {
                         // Buffer (not push directly): see `gap_rows` doc above.
                         gap_rows.push((env.clone(), g.clone()));
@@ -262,6 +361,13 @@ pub fn process_ticker(
     for (env, marker) in &gap_rows {
         gaps.push(env, marker);
     }
+
+    let (span_us, hole_us) = coverage(
+        &gap_rows,
+        snap_ts_us,
+        (book_first_us, book_last_us),
+        (trade_first_us, trade_last_us),
+    );
 
     // Finish all builders first; the batch row counts are the single source of
     // truth for the manifest (no separate length bookkeeping to drift).
@@ -381,6 +487,8 @@ pub fn process_ticker(
         verify_mismatches,
         verify_skipped,
         underflows,
+        span_us,
+        hole_us,
     };
     manifest.write(&ticker_out.join("manifest.json"))?;
 
@@ -795,6 +903,10 @@ mod tests {
         let m = read_manifest(&out, "KDPTEST-VG");
         assert_eq!(m["verify_skipped"], 1);
         assert_eq!(m["verify_mismatches"], 0);
+        // Neither a book event nor a trade in this dir: there is no span to
+        // measure and so no honest hole figure either -- both stay null.
+        assert!(m["span_us"].is_null());
+        assert!(m["hole_us"].is_null());
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);
@@ -884,6 +996,15 @@ mod tests {
         );
         assert_eq!(col_str(&gb, "reason").value(1), "seq_jump");
 
+        // Coverage over the same fixture: the book spans 00:00:00..00:00:08.
+        // The t1 verify_mismatch gap never re-anchors, so it holes to span_end
+        // (7s); the t10 stream gap opened AFTER the last book row -- the capture
+        // died inside that hole, which is unmeasurable, so it is dropped rather
+        // than counted as a negative window.
+        let m = read_manifest(&out, "KDPTEST-VO");
+        assert_eq!(m["span_us"], 8_000_000i64);
+        assert_eq!(m["hole_us"], 7_000_000i64);
+
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);
     }
@@ -905,6 +1026,119 @@ mod tests {
 
         let m = read_manifest(&out, "KDPTEST-VN");
         assert_eq!(m["verify_checks"], 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    // --- span_us / hole_us (the kdp-data coverage() rule, ported) -------------
+
+    #[test]
+    fn gapless_dir_stamps_full_span_and_zero_hole() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-03T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-SP","ts":"2026-06-03T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        let d1 = r#"{"v":1,"recv_ts":"2026-06-03T00:00:10Z","seq":2,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-SP","ts":"2026-06-03T00:00:10Z","side":"yes","price":450000,"delta":10}}"#;
+        let d2 = r#"{"v":1,"recv_ts":"2026-06-03T00:01:00Z","seq":3,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-SP","ts":"2026-06-03T00:01:00Z","side":"yes","price":450000,"delta":10}}"#;
+        let root = fixture_ob_lines("span_gapless", "KDPTEST-SP", &[snap, d1, d2]);
+        let out = root.with_file_name("span_gapless_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        run(&root, &out, None, Format::Parquet).unwrap();
+
+        let m = read_manifest(&out, "KDPTEST-SP");
+        assert_eq!(
+            m["span_us"], 60_000_000i64,
+            "book recv_ts extent t0..t0+60s"
+        );
+        assert_eq!(m["hole_us"], 0i64, "no gaps -> a real, measured zero");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn gap_resolved_by_snapshot_holes_until_the_reanchor() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-03T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-SG","ts":"2026-06-03T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        let gap = r#"{"v":1,"recv_ts":"2026-06-03T00:00:10Z","seq":5,"sid":1,"kind":"gap","data":{"reason":"seq_jump","ticker":"KDPTEST-SG","channel":"orderbook","last_seq":5,"observed_seq":8,"detail":"seq jumped 5 -> 8"}}"#;
+        // A second gap INSIDE the first one's window: both close at the same
+        // snapshot, so the two windows overlap and must union to 20s, not sum
+        // to 30s.
+        let gap2 = r#"{"v":1,"recv_ts":"2026-06-03T00:00:20Z","seq":6,"sid":1,"kind":"gap","data":{"reason":"seq_jump","ticker":"KDPTEST-SG","channel":"orderbook","last_seq":6,"observed_seq":9,"detail":"seq jumped 6 -> 9"}}"#;
+        // The re-anchoring snapshot closes both holes at 00:00:30.
+        let resnap = r#"{"v":1,"recv_ts":"2026-06-03T00:00:30Z","seq":8,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-SG","ts":"2026-06-03T00:00:30Z","yes":[{"price":460000,"quantity":50}],"no":[]}}"#;
+        let d = r#"{"v":1,"recv_ts":"2026-06-03T00:01:00Z","seq":9,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-SG","ts":"2026-06-03T00:01:00Z","side":"yes","price":460000,"delta":10}}"#;
+        let root = fixture_ob_lines(
+            "span_gap_resolved",
+            "KDPTEST-SG",
+            &[snap, gap, gap2, resnap, d],
+        );
+        let out = root.with_file_name("span_gap_resolved_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        run(&root, &out, None, Format::Parquet).unwrap();
+
+        let m = read_manifest(&out, "KDPTEST-SG");
+        assert_eq!(m["span_us"], 60_000_000i64);
+        assert_eq!(
+            m["hole_us"], 20_000_000i64,
+            "hole opens at the first gap, closes at the re-anchoring snapshot, and \
+             the overlapping second gap is unioned in, not added"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn trailing_gap_with_no_reanchor_holes_to_span_end() {
+        let snap = r#"{"v":1,"recv_ts":"2026-06-03T00:00:00Z","seq":1,"sid":1,"kind":"snapshot","data":{"ticker":"KDPTEST-SU","ts":"2026-06-03T00:00:00Z","yes":[{"price":450000,"quantity":100}],"no":[]}}"#;
+        let gap = r#"{"v":1,"recv_ts":"2026-06-03T00:00:10Z","seq":5,"sid":1,"kind":"gap","data":{"reason":"reconnect","ticker":"KDPTEST-SU","channel":"orderbook","last_seq":null,"observed_seq":null,"detail":"reconnected"}}"#;
+        // A delta, NOT a snapshot -- nothing re-anchors the book after the gap.
+        let d = r#"{"v":1,"recv_ts":"2026-06-03T00:00:40Z","seq":9,"sid":1,"kind":"delta","data":{"ticker":"KDPTEST-SU","ts":"2026-06-03T00:00:40Z","side":"yes","price":450000,"delta":10}}"#;
+        let root = fixture_ob_lines("span_gap_unresolved", "KDPTEST-SU", &[snap, gap, d]);
+        let out = root.with_file_name("span_gap_unresolved_out");
+        let _ = std::fs::remove_dir_all(&out);
+
+        run(&root, &out, None, Format::Parquet).unwrap();
+
+        let m = read_manifest(&out, "KDPTEST-SU");
+        assert_eq!(m["span_us"], 40_000_000i64);
+        assert_eq!(
+            m["hole_us"], 30_000_000i64,
+            "an unresolved gap still holes to span_end (coverage.py parity)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn trades_only_dir_has_trade_span_and_null_hole() {
+        // No orderbook records at all (the file exists but is empty), so the span
+        // falls back to the trade tape's event_ts extent and uptime stays unknown.
+        let root = fixture_ob_lines("span_trades_only", "KDPTEST-TO", &[]);
+        let t1 = r#"{"v":1,"recv_ts":"2026-06-03T00:00:01Z","seq":1,"sid":2,"kind":"trade","data":{"ticker":"KDPTEST-TO","ts":"2026-06-03T00:00:00Z","price":460000,"count":5000,"taker_side":"yes","taker_book_side":"bid","trade_id":"t1"}}"#;
+        // recv_ts is 20s later than t1's, but event_ts is only 5s later: the span
+        // must be the EVENT extent (5s), which is what coverage.py reads.
+        let t2 = r#"{"v":1,"recv_ts":"2026-06-03T00:00:21Z","seq":2,"sid":2,"kind":"trade","data":{"ticker":"KDPTEST-TO","ts":"2026-06-03T00:00:05Z","price":470000,"count":100,"taker_side":"no","taker_book_side":"ask","trade_id":"t2"}}"#;
+        let tr = root.join("KDPTEST-TO").join("trade");
+        let mut f = File::create(tr.join("2026-06-01.jsonl")).unwrap();
+        writeln!(f, "{t1}").unwrap();
+        writeln!(f, "{t2}").unwrap();
+
+        let out = root.with_file_name("span_trades_only_out");
+        let _ = std::fs::remove_dir_all(&out);
+        let outcomes = run(&root, &out, None, Format::Parquet).unwrap();
+        assert_eq!(outcomes[0].counts.book_events, 0);
+
+        let m = read_manifest(&out, "KDPTEST-TO");
+        assert_eq!(
+            m["span_us"], 5_000_000i64,
+            "trades event_ts extent, not recv_ts"
+        );
+        assert!(
+            m["hole_us"].is_null(),
+            "uptime is an L2 concept: a trades-only dir must not fake a 0 hole"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);

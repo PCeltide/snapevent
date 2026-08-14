@@ -158,9 +158,15 @@ async fn resolve_unit(
                         %session, "resolved scheduled event; capturing"
                     );
                     return Some(CaptureUnit {
-                        session,
+                        session: session.clone(),
                         tickers,
-                        series: entry.series.clone(),
+                        // session_name() strips the side suffix off the matched
+                        // tickers, which reconstructs the event ticker. The
+                        // scheduler resolves by team-code match and never reads
+                        // the API's event_ticker field, so this is the best
+                        // available value; if it is ever wrong the unit simply
+                        // runs to its backstop (loud, not silent).
+                        event: session,
                         remote_prefix: entry.remote_prefix.clone(),
                     });
                 }
@@ -303,6 +309,7 @@ pub async fn run_scheduled(args: &crate::args::Args) -> anyhow::Result<()> {
             poll_secs: cfg.poll_secs,
             max_secs: entry.max_hours.unwrap_or(cfg.default_max_hours) * 3600,
             archive_cmd: cfg.archive_cmd.clone(),
+            checkpoint_cmd: String::new(),
             verify_interval_secs: cfg.verify_interval_secs,
         };
         let creds2 = Arc::clone(&creds);

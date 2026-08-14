@@ -5,7 +5,7 @@
 //! capture-and-archive goal — far smaller on disk (dictionary + RLE + ZSTD,
 //! per-column) and queryable with predicate/row-group pushdown. Feather
 //! (`--format feather`) is offered for fast zero-copy local reload at the cost of
-//! size; see `docs/dev-context/phase-3-processing.md`.
+//! size; see ADR-002 for the format decision.
 
 use std::fs::File;
 use std::path::Path;

@@ -1,0 +1,11 @@
+# kdp-digest.timer
+[Unit]
+Description=kdp nightly digest schedule
+
+[Timer]
+OnCalendar=*-*-* 06:30:00 UTC
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

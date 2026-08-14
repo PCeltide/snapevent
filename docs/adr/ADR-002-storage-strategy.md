@@ -100,5 +100,5 @@ flattened mutation log that fully reconstructs every order-book state, and raw
 fallbacks/gaps are preserved in their own tables. Each ticker's `manifest.json`
 carries a `complete` flag (true iff every source line decoded **and** no raw
 fallbacks remain — i.e. the structured tables are the whole story); when true, the
-raw JSONL is safe to delete. See `docs/dev-context/phase-3-processing.md` for the
-table schemas and the replay contract.
+raw JSONL is safe to delete. See `docs/data-guide.md` for the table schemas and
+the replay contract.

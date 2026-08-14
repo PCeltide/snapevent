@@ -15,6 +15,8 @@ if [[ -f "$ENV_FILE" ]]; then set -a; . "$ENV_FILE"; set +a; fi
 : "${KDP_ALERT_WEBHOOK:=}"
 : "${KDP_DISK_FLOOR_GIB:=5}"
 : "${KDP_STALE_SECONDS:=180}"   # active capture with no new jsonl this long = stuck
+: "${KDP_ERROR_WINDOW_MIN:=6}"  # journal lookback for the ERROR-rate check (timer fires every 5min)
+: "${KDP_ERROR_FLOOR:=5}"       # more ERROR lines than this in the window = alert (0 disables)
 : "${KDP_ALERT_THROTTLE_SEC:=3600}"                  # suppress an identical ntfy push re-sent within this window
 : "${KDP_ALERT_STATE_DIR:=/var/lib/kdp/alert-state}" # per-alert last-sent timestamps live here
 
@@ -86,6 +88,41 @@ while IFS= read -r unit; do
     problems=$((problems+1))
   fi
 done < <(systemctl list-units 'kdp-capture@*' --state=active --no-legend --plain 2>/dev/null | awk '{print $1}')
+
+# 4. ERROR lines in the kdp journal.
+#
+# Until 2026-08-09 this watchdog looked only at disk, failed units and stale
+# capture -- so it reported "ok" straight through 1,062 rclone ERRORs at the
+# UTC rollover (the checkpoint/prune race, fixed in kdp-archive.sh). That run
+# was harmless, but an rclone failure that DID matter would have been just as
+# silent. Nothing here parses the errors; the point is that a burst of them
+# reaches a human at all.
+#
+# Text match, not --priority=err: rclone/kdp-process errors arrive as service
+# stderr, which journald records at the unit's SyslogLevel (info), so a
+# priority filter sees none of them. Both `ERROR` (rclone) and tracing's
+# `ERROR` level match the same token.
+#
+# Our OWN alert lines are excluded. alert() logs "kdp-health: ALERT: <msg>" and
+# the msg below contains the word ERROR, so without the filter this check
+# counts its own output: bounded (a 5-min timer against a 6-min window yields
+# at most 2 self-lines, so floor 5 cannot self-sustain) but it would latch on
+# permanently at a floor of 2 or below. Excluding the lines removes the
+# constraint instead of documenting it -- kdp-health logs only its own alerts
+# and "ok", so nothing real is dropped.
+_err_lines() {
+  journalctl -u 'kdp-*' --since "-${KDP_ERROR_WINDOW_MIN}min" --no-pager -o cat 2>/dev/null \
+    | grep -v 'kdp-health:' | grep 'ERROR' || true
+}
+if (( KDP_ERROR_FLOOR > 0 )); then
+  errs="$(_err_lines | grep -c '' || true)"
+  errs="${errs:-0}"
+  if (( errs > KDP_ERROR_FLOOR )); then
+    worst="$(_err_lines | head -1 | cut -c1-160 || true)"
+    alert "${errs} ERROR line(s) in the kdp journal over ${KDP_ERROR_WINDOW_MIN}min (floor ${KDP_ERROR_FLOOR}); first: ${worst}"
+    problems=$((problems+1))
+  fi
+fi
 
 if (( problems == 0 )); then
   log "ok"

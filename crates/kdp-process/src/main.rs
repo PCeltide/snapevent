@@ -4,8 +4,8 @@
 //! columnar tables (Parquet by default, Feather with `--format feather`) plus a
 //! `manifest.json`. The lossless `book_events` table *replaces* the raw orderbook
 //! JSONL; once the manifest reports `complete: true` and the outputs are
-//! verified, the raw capture files can be dropped. See
-//! `docs/dev-context/phase-3-processing.md`.
+//! verified, the raw capture files can be dropped. See `docs/data-guide.md`
+//! for the output layout and ADR-002 for why JSONL is derived to Parquet.
 //!
 //! Usage:
 //! ```text

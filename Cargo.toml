@@ -17,9 +17,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# kdp-load-py is deliberately OUTSIDE the workspace: pyo3's macro-generated
+# FFI glue is incompatible with the workspace-wide forbid(unsafe_code) lint,
+# and its extension-module/cdylib build doesn't belong in `cargo test
+# --workspace`. It builds via maturin (scripts/check-load-py.ps1).
+exclude = ["crates/kdp-load-py"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"

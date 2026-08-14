@@ -74,7 +74,14 @@ fn universe_name(series_ticker: &str) -> String {
 fn suggestion(series_ticker: &str) -> String {
     let name = universe_name(series_ticker);
     format!(
-        "\nTo capture this series continuously:\n\n  kdp-cli capture-universe --series {series_ticker} --name {name}\n\n\
+        "\nTo capture this series continuously:\n\n  \
+         kdp-cli capture-universe --series {series_ticker} --name {name}\n\n\
+         Bounded window (tournament opt-in) -- bare date is inclusive:\n\n  \
+         kdp-cli capture-universe --series {series_ticker} --name {name} --until 2026-12-31\n\n\
+         Server opt-in -- write /etc/kdp/universes/{name}.env:\n\n  \
+         KDP_UNIVERSE_SERIES={series_ticker}\n  \
+         KDP_UNIVERSE_EXTRA=--until 2026-12-31\n\n  \
+         then: systemctl start kdp-universe@{name}\n\n\
          (add --max-units / --min-volume to bound breadth; see README. One-off or\n \
          long-lived series may need capture-scheduled or a --max-hours backstop.)"
     )
@@ -366,6 +373,10 @@ mod tests {
     fn suggestion_contains_exact_capture_universe_line() {
         let s = suggestion("KXBTCD");
         assert!(s.contains("kdp-cli capture-universe --series KXBTCD --name kxbtcd"));
+        assert!(s.contains("--until"));
+        assert!(s.contains("/etc/kdp/universes/kxbtcd.env"));
+        assert!(s.contains("KDP_UNIVERSE_SERIES=KXBTCD"));
+        assert!(s.contains("systemctl start kdp-universe@kxbtcd"));
     }
 
     #[tokio::test]

@@ -291,10 +291,12 @@ async fn verify_sweep(
     }
 }
 
-/// Parse a duration like `"300"`, `"90s"`, `"5m"`, or `"1h"` into a [`Duration`].
-fn parse_duration(s: &str) -> anyhow::Result<Duration> {
+/// Parse a duration like `"300"`, `"90s"`, `"5m"`, `"1h"`, or `"2d"` into a [`Duration`].
+pub(crate) fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     let s = s.trim();
-    let (num, mult) = if let Some(n) = s.strip_suffix('h') {
+    let (num, mult) = if let Some(n) = s.strip_suffix('d') {
+        (n, 86_400)
+    } else if let Some(n) = s.strip_suffix('h') {
         (n, 3600)
     } else if let Some(n) = s.strip_suffix('m') {
         (n, 60)
@@ -306,7 +308,7 @@ fn parse_duration(s: &str) -> anyhow::Result<Duration> {
     let value: u64 = num
         .trim()
         .parse()
-        .with_context(|| format!("invalid duration {s:?} (use e.g. 90s, 5m, 1h)"))?;
+        .with_context(|| format!("invalid duration {s:?} (use e.g. 90s, 5m, 1h, 2d)"))?;
     let secs = value
         .checked_mul(mult)
         .with_context(|| format!("duration {s:?} is too large"))?;
@@ -744,6 +746,14 @@ mod tests {
         assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
         assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn parse_duration_supports_days() {
+        assert_eq!(
+            parse_duration("2d").unwrap(),
+            Duration::from_secs(2 * 86_400)
+        );
     }
 
     #[test]

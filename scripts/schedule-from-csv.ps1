@@ -23,9 +23,9 @@
 
 .EXAMPLE
   pwsh -File scripts/schedule-from-csv.ps1 `
-    -Csv "C:\path\cup_2026_matches.csv" `
-    -Series KXCUPMATCH -RemotePrefix remote:kdp/cup-2026 -IdPrefix cup `
-    -Out deploy/schedules/cup-2026.jsonl
+    -Csv "C:\path\my_matches.csv" `
+    -Series KXCUPMATCH -RemotePrefix remote:kdp/my-cup -IdPrefix cup `
+    -Out deploy/schedules/my-cup.jsonl
 #>
 param(
   [Parameter(Mandatory)] [string] $Csv,

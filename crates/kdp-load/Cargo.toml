@@ -3,7 +3,7 @@
 # A LEAF library: depends only on kdp-core within the workspace (arrow/parquet
 # stay internal, never leaked in the public API). Nothing in the workspace
 # depends on it; external consumers (e.g. a backtest framework) take it as a
-# git dependency. See docs/plans/2026-07-06-kdp-load-design.md.
+# git dependency.
 
 [package]
 name = "kdp-load"

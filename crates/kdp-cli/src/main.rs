@@ -16,6 +16,7 @@ mod backfill;
 mod capture;
 mod catalog;
 mod discover;
+mod event_time;
 mod hourly;
 mod schedule;
 mod scheduled;
@@ -111,9 +112,11 @@ fn print_usage() {
          \x20                                         capture pre-scheduled events from a JSONL schedule: arm each\n\
          \x20                                         at start-lead, resolve its markets (predicted ticker or by\n\
          \x20                                         teams), capture L2+trades -> settle -> background archive\n\
-         \x20 capture-universe --series A,B,C --name NAME [--status open] [--min-volume 0]\n\
+         \x20 capture-universe --series A,B,C --name NAME [--status open,unopened] [--min-volume 0]\n\
          \x20                  [--rediscover-interval 300] [--max-units 8] [--out DIR] [--max-hours 8]\n\
-         \x20                  [--grace 180] [--poll 30] [--archive-cmd PATH] [--verify-interval 900]\n\
+         \x20                  [--grace 180] [--poll 30] [--archive-cmd PATH] [--checkpoint-cmd PATH]\n\
+         \x20                  [--verify-interval 900] [--arm-lead-min 30] [--clash-sub on]\n\
+         \x20                  [--until DATE|RFC3339] [--for DUR]\n\
          \x20                                         declaratively capture EVERY event in the series matching the\n\
          \x20                                         filter: sweep, arm each new event cohort (cap: --max-units,\n\
          \x20                                         loud warn past it), settle -> background archive; re-sweeps\n\

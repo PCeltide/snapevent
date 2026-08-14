@@ -267,11 +267,14 @@ pub async fn list_markets(client: &reqwest::Client, limit: u32) -> Result<Vec<Ma
 /// unit-tested without a live server. `min_close_ts`/`max_close_ts` are unix
 /// seconds bounding the market `close_time` — the key to enumerating a
 /// long-running series chunk-by-chunk (a full year of hourly markets is far too
-/// many for a single cursor walk).
+/// many for a single cursor walk). `event_ticker` scopes to ONE event, which is
+/// what the settlement watcher needs: a cohort is an event, so the response is
+/// exactly the unit's target set (see `list_markets_by_event`).
 fn markets_query(
     limit: u32,
     status: Option<&str>,
     series_ticker: Option<&str>,
+    event_ticker: Option<&str>,
     min_close_ts: Option<i64>,
     max_close_ts: Option<i64>,
     cursor: Option<&str>,
@@ -282,6 +285,9 @@ fn markets_query(
     }
     if let Some(s) = series_ticker {
         query.push(("series_ticker", s.to_string()));
+    }
+    if let Some(e) = event_ticker {
+        query.push(("event_ticker", e.to_string()));
     }
     if let Some(t) = min_close_ts {
         query.push(("min_close_ts", t.to_string()));
@@ -314,11 +320,46 @@ pub async fn list_markets_page(
         limit,
         status,
         series_ticker,
+        None,
         min_close_ts,
         max_close_ts,
         cursor,
     );
 
+    let resp = get_with_retry(client, &url, &query).await?;
+    let body: MarketsResponse = resp.json().await?;
+    let next = body.cursor.filter(|c| !c.is_empty());
+    Ok((body.markets, next))
+}
+
+/// Fetch one page of the markets belonging to a single **event**
+/// (`GET /markets?event_ticker=…`). Returns the page plus the next cursor.
+///
+/// This is the settlement watcher's poll (`kdp-cli::supervisor`). A capture
+/// cohort IS an event, and Kalshi's largest live events run 188-300 markets, so
+/// at `limit = 1000` the response is the unit's whole target set in one request
+/// — which is what lets `all_settled` keep its conservative "a ticker absent
+/// from the response is NOT terminal" rule. Under a series-scoped poll that
+/// same rule was fatal: the first 1000-row page of a series rarely contains a
+/// given cohort, so the unit could never settle.
+///
+/// **No `status` filter, deliberately.** The poll must see targets *after* they
+/// go terminal; filtering to `open` would hide exactly the transition it exists
+/// to detect. (And Kalshi's query vocabulary differs from its response
+/// vocabulary — `open` returns `active`, `settled` returns `finalized` — so a
+/// status filter here would be doubly wrong.)
+///
+/// A non-`None` cursor means the event exceeded `limit` and the caller is
+/// seeing a partial target set; callers MUST treat that as "cannot conclude
+/// settled" and say so loudly, never page silently.
+#[instrument(skip(client))]
+pub async fn list_markets_by_event(
+    client: &reqwest::Client,
+    event_ticker: &str,
+    limit: u32,
+) -> Result<(Vec<Market>, Option<String>)> {
+    let url = format!("{KALSHI_API_BASE}/markets");
+    let query = markets_query(limit, None, None, Some(event_ticker), None, None, None);
     let resp = get_with_retry(client, &url, &query).await?;
     let body: MarketsResponse = resp.json().await?;
     let next = body.cursor.filter(|c| !c.is_empty());
@@ -842,6 +883,7 @@ mod tests {
             1000,
             Some("settled"),
             Some("KXBTCD"),
+            None,
             Some(100),
             Some(200),
             Some("cur"),
@@ -852,10 +894,30 @@ mod tests {
         assert!(q.contains(&("min_close_ts", "100".to_string())));
         assert!(q.contains(&("max_close_ts", "200".to_string())));
         assert!(q.contains(&("cursor", "cur".to_string())));
+        assert!(!q.iter().any(|(k, _)| *k == "event_ticker"));
         // omitted filters produce no params
         assert_eq!(
-            markets_query(500, None, None, None, None, None),
+            markets_query(500, None, None, None, None, None, None),
             vec![("limit", "500".to_string())]
+        );
+    }
+
+    #[test]
+    fn markets_query_carries_the_event_filter_alone() {
+        // The settlement poll scopes by EVENT, never by series: a series-scoped
+        // page truncates at 1000 rows and a cohort's targets are routinely absent
+        // from it, which is why settlement detection never once fired in
+        // production (2026-08-08 post-mortem). An event-scoped query returns
+        // exactly the cohort.
+        let q = markets_query(1000, None, None, Some("KXBTC-26AUG0809"), None, None, None);
+        assert!(q.contains(&("event_ticker", "KXBTC-26AUG0809".to_string())));
+        assert!(
+            !q.iter().any(|(k, _)| *k == "series_ticker"),
+            "the event-scoped poll must not also narrow by series: {q:?}"
+        );
+        assert!(
+            !q.iter().any(|(k, _)| *k == "status"),
+            "status must stay absent -- the poll needs terminal markets returned too"
         );
     }
 
@@ -1275,6 +1337,46 @@ FSCdm2zv/hgDDD5k5SdmeEfR
                     panic!("expected Book, got Undecodable for {ticker:?}: {error}");
                 }
             }
+        }
+    }
+
+    /// One-time live probe (never run in CI). Confirms `GET /markets?event_ticker=`
+    /// returns that event's markets and nothing else — the assumption the whole
+    /// settlement fix rests on.
+    ///
+    /// ```text
+    /// export PATH="$HOME/.cargo/bin:$PATH" \
+    ///   && cargo test -p kdp-kalshi live_event_scoped_markets_probe -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hits the live Kalshi API"]
+    async fn live_event_scoped_markets_probe() {
+        let client = reqwest::Client::new();
+        let (open, _) =
+            list_markets_page(&client, 100, Some("open"), Some("KXBTC"), None, None, None)
+                .await
+                .expect("list open KXBTC markets");
+        let event = open
+            .iter()
+            .find_map(|m| m.event_ticker.clone())
+            .expect("need at least one open KXBTC market with an event_ticker");
+
+        let (markets, next) = list_markets_by_event(&client, &event, 1000)
+            .await
+            .expect("event-scoped listing");
+        println!("event {event}: {} markets, next={next:?}", markets.len());
+        assert!(!markets.is_empty(), "event-scoped query returned nothing");
+        assert!(
+            next.is_none(),
+            "a single cohort must fit one 1000-row page; got a cursor"
+        );
+        for m in &markets {
+            assert_eq!(
+                m.event_ticker.as_deref(),
+                Some(event.as_str()),
+                "event-scoped query leaked a market from another event: {:?}",
+                m.ticker.as_str()
+            );
         }
     }
 }

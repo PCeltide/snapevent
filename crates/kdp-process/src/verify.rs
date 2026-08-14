@@ -251,7 +251,9 @@ fn mismatch_detail(ours: &State, rest: &State) -> String {
 /// per verify observation.
 pub struct VerifyEngine {
     /// Recent `(recv_ts_us, canonical book state)` pairs, ascending by
-    /// timestamp, pruned to `VERIFY_WINDOW_US` behind the latest book event.
+    /// timestamp, pruned to `VERIFY_WINDOW_US` behind the latest book event
+    /// PLUS the newest entry at-or-before that cutoff — which is the state
+    /// still in force at the cutoff instant, not history (see `on_book_event`).
     window: VecDeque<(i64, State)>,
     /// The verify check awaiting a forward match, a deadline, a gap, or EOF.
     pending: Option<PendingCheck>,
@@ -295,13 +297,18 @@ impl VerifyEngine {
         }
 
         self.window.push_back((recv_ts_us, state));
+        // Prune to the window but ALWAYS retain the newest entry at-or-before
+        // the cutoff. A book state is a step function: it stays in force until
+        // the next book event, so the last pre-cutoff entry is the state the
+        // book was actually in AT the cutoff instant, not stale history.
+        // Dropping it silently narrows the "two-sided" window to "as far back
+        // as the previous book event" -- and on a thin strike where nothing has
+        // traded for minutes, that is no backward window at all, which is
+        // exactly where the REST-vs-WS race this module exists to absorb
+        // produces its false mismatches. Costs one extra entry, never more.
         let cutoff = recv_ts_us - VERIFY_WINDOW_US;
-        while let Some(&(ts, _)) = self.window.front() {
-            if ts < cutoff {
-                self.window.pop_front();
-            } else {
-                break;
-            }
+        while self.window.len() >= 2 && self.window[1].0 <= cutoff {
+            self.window.pop_front();
         }
 
         if is_snapshot {
@@ -374,11 +381,17 @@ impl VerifyEngine {
         // (smallest |lag| first) for a backward match.
         let threshold = recv_ts_us - VERIFY_WINDOW_US;
         for (ts, state) in self.window.iter().rev() {
-            if *ts < threshold {
-                break; // ascending-ordered deque: everything older also fails
-            }
+            // The newest entry older than the threshold was still the book's
+            // state AT the threshold instant (states hold until the next
+            // event), so it is inside the window and must be tested before we
+            // stop -- test first, break after. Everything older than IT is
+            // genuinely outside.
+            let established_before_window = *ts < threshold;
             if *state == rest_state {
-                let lag_us = *ts - recv_ts_us;
+                // Report the instant inside the window at which the two were
+                // equal, not when that state was established, so |lag| can
+                // never exceed VERIFY_WINDOW_US.
+                let lag_us = (*ts).max(threshold) - recv_ts_us;
                 self.rows.push(VerifyOutcomeRow {
                     recv_ts_us,
                     outcome: "matched",
@@ -388,6 +401,9 @@ impl VerifyEngine {
                     detail: String::new(),
                 });
                 return;
+            }
+            if established_before_window {
+                break;
             }
         }
 
@@ -463,6 +479,68 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, "matched");
         assert_eq!(rows[0].match_lag_us, Some(-2_000_000));
+    }
+
+    /// The production false-positive, reproduced from the box's dump of
+    /// `KXBTC-26AUG1205-B63750`: a cancel removed `no @ 0.51` (4.00 contracts)
+    /// 1.4 ms before the verify record's own `recv_ts`, and the REST read we
+    /// compared against was that few ms stale. The pre-cancel state is what
+    /// REST saw, and it was in force for the whole preceding 10 s — but the
+    /// only book event establishing it landed 10 s back, outside the 5 s
+    /// window, so the old prune had evicted it and the two-sided window had
+    /// nothing to match against. Thin strikes hit this and liquid ones never
+    /// do: on a liquid book some event always lands inside the window and
+    /// carries the state forward.
+    #[test]
+    fn stale_rest_read_matches_the_state_still_in_force_from_before_the_window() {
+        let mut engine = VerifyEngine::new();
+        let verify_ts = 1_786_522_777_128_110i64;
+        let cancel_ts = 1_786_522_777_126_709i64; // 1.4 ms before the verify
+        let quiet_ts = cancel_ts - 10_000_000; // last event before it: 10 s back
+
+        // The book as REST still saw it, established 10 s before the cancel.
+        let with_level = book_of(&[(490_000, 1_000)], &[(510_000, 400)]);
+        engine.on_book_event(quiet_ts, &with_level, true);
+
+        // The cancel we received and applied correctly and on time.
+        let without_level = book_of(&[(490_000, 1_000)], &[]);
+        engine.on_book_event(cancel_ts, &without_level, false);
+
+        engine.on_verify(
+            verify_ts,
+            &levels(&[(490_000, 1_000)]),
+            &levels(&[(510_000, 400)]),
+            &without_level,
+        );
+
+        let rows = engine.finish();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].outcome, "matched",
+            "a REST read stale by 1.4 ms is the race the window exists to absorb"
+        );
+        assert_eq!(
+            rows[0].match_lag_us,
+            Some(-VERIFY_WINDOW_US),
+            "the state was in force at the window edge; lag is clamped there, \
+             never reported as the older instant it was established"
+        );
+    }
+
+    /// The prune keeps exactly ONE entry from before the cutoff, not all of
+    /// them — the window must not grow without bound on a busy book.
+    #[test]
+    fn prune_keeps_one_pre_cutoff_entry_and_no_more() {
+        let mut engine = VerifyEngine::new();
+        for i in 0..10i64 {
+            let book = book_of(&[(100_000 + i as u32, 100)], &[]);
+            engine.on_book_event(i * 1_000_000, &book, false);
+        }
+        // Latest event at t=9s, so the cutoff is 4s. The entry AT 4s is the
+        // newest at-or-before it and survives; 0..=3s are all superseded by it
+        // and go. 4s..=9s is six entries.
+        assert_eq!(engine.window.len(), 6);
+        assert_eq!(engine.window[0].0, 4_000_000);
     }
 
     #[test]
@@ -583,9 +661,17 @@ mod tests {
         let old_book = book_of(&[(100_000, 500)], &[]);
         engine.on_book_event(0, &old_book, true); // pushed at ts=0
 
-        // Verify 6s later (beyond VERIFY_WINDOW_US=5s): the ts=0 state must
-        // NOT count as a backward match, even though it equals rest.
+        // Superseded at 0.5s, which is BEFORE the verify's window edge at 1s,
+        // so the ts=0 state was genuinely not in force anywhere inside the
+        // window. Feeding this event is what makes the assertion below mean
+        // what it says: without it the engine is never told the book changed,
+        // so under its own step-function model the ts=0 state is still in
+        // force at the edge and matching it is correct, not spurious.
         let different_current = book_of(&[(200_000, 500)], &[]);
+        engine.on_book_event(500_000, &different_current, false);
+
+        // Verify 6s after the snapshot (beyond VERIFY_WINDOW_US=5s): the ts=0
+        // state must NOT count as a backward match, even though it equals rest.
         engine.on_verify(
             6_000_000,
             &levels(&[(100_000, 500)]),

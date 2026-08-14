@@ -325,6 +325,23 @@ files, time span), per-table row counts, and the all-important verdict:
   "notes": ["all source records decoded into the structured tables; the raw capture files are safe to drop once these outputs are verified"] }
 ```
 
+**`tool_version` identifies the BUILD, not the commit.** It is
+`env!("CARGO_PKG_VERSION")`, resolved when the binary is compiled — so every
+build made between one release and the next stamps the *older* version string.
+That is fine while a version's behaviour is uniform, and misleading the moment
+it is not: deploy a fix that changes what a field *means* before the version
+bump lands, and both the pre-fix and post-fix outputs carry the same
+`tool_version`, with no way to tell them apart from inside the dataset. Two
+consequences worth knowing:
+
+- If a value looks wrong for a manifest's stated version, check the
+  `CHANGELOG` entry *after* that version too — the producing build may predate
+  the bump.
+- **Re-processing rewrites `tool_version` with the re-running binary's own
+  value.** So repairing old outputs with a fixed-but-not-yet-bumped build
+  stamps them with the same ambiguous string as the corrupt ones. Bump and
+  rebuild first, then re-process.
+
 **`complete: true` is the green light to delete the raw JSONL.** It means:
 
 ```
@@ -348,6 +365,30 @@ to whether what was captured matches *what the venue had* (capture→venue). A
 capture can be `complete: true` and still carry a mismatch — both facts are
 reported, neither is hidden in the other. Manifests written before these
 fields existed simply lack them (readers surface `null`, never a fake `0`).
+
+**`span_us` / `hole_us` — capture span and uptime.** `span_us` is the
+`book_events` `recv_ts_us` extent (a directory with no book events falls back
+to the `trades` `event_ts_us` extent; neither present -> `null`); `hole_us` is
+the unioned, span-clamped hole time from the `gaps` table -- the same rule
+`kdp-data`'s `coverage()` uses, so the manifest stamp and the Python accounting
+can never disagree about the same directory. Uptime = `1 - hole_us / span_us`.
+A few things worth knowing before you use these fields:
+
+- `span_us` is deliberately **not** `last_recv_ts_us - first_recv_ts_us`.
+  Those two neighbor fields fold in *every* record -- gap markers, verify rows,
+  anything with a `recv_ts` -- while `span_us` is scoped to book events (or the
+  trades fallback) only, so the two can legitimately disagree.
+- Trade-channel gaps count toward `hole_us`, for parity with `kdp-data`
+  `coverage()` -- this is asymmetric with the verify sweep, which gates only on
+  orderbook-channel gaps (a trade-tape hole says nothing about book fidelity).
+- Three distinct "no value" states, don't conflate them: `hole_us: null` means
+  no book events exist (unknown uptime, never a fake `0`); `span_us: 0` is a
+  real, legitimate value (a single-instant book) -- guard the divide; the keys
+  **absent entirely** mean a pre-`v0.3.0` manifest (absent is not the same as
+  `0`). The jq uptime recipe below already carries both guards:
+  ```sh
+  jq 'select(.span_us > 0 and .hole_us != null) | 1 - .hole_us / .span_us' manifest.json
+  ```
 
 > **The golden rule:** delete a raw capture **only** when its `manifest.complete`
 > is `true` and you've verified the output. The lossless `book_events` table is
@@ -444,6 +485,16 @@ bt = pl.read_parquet("…/book_top.parquet").with_columns(
 Step 4 is the safety latch. Everything in this guide exists to make that one line
 trustworthy.
 
+**The 4-5PM ET clash slot.** On contracts like `KXBTCD`, Kalshi's
+higher-cadence contract owns a shared expiry: the hourly whose close falls at
+4-5PM ET is never listed at all (the daily owns it; the weekly on Fridays;
+monthly/annual are skipped rather than substituted). `capture-universe`
+substitutes the owning contract's expiry-hour session in that hour's place, so
+a `KXBTCD-26AUG01` daily session shows up once a day alongside the hourly
+ones. An hourly-only capture (`capture-hourly`, no clash-sub) has no
+substitute to arm, so that slot correctly shows up as a known hole — not a bug
+(see `docs/runbooks/runbook-universe.md` §3).
+
 **Loading it back (Rust): `kdp-load`.** For replay consumers (backtests), the
 `crates/kdp-load` library turns a processed ticker directory into a single
 deterministic, time-ordered, TYPED event stream — snapshots grouped, integer
@@ -458,7 +509,9 @@ observations are not replay events, so on a settled market the stream's last
 timestamp can trail the manifest's `last_recv_ts_us` by up to one verify
 interval — take "capture end" from the manifest, never from
 `events().last()`. Full contract: the crate rustdoc
-(`cargo doc -p kdp-load --open`).
+(`cargo doc -p kdp-load --open`). The same replay is callable **from
+Python** via the `kdp_load` bindings (`crates/kdp-load-py`, built with
+`scripts/check-load-py.ps1`) — see `python/README.md` "Full-depth replay".
 
 **Loading it back (Python): `kdp-data`.** For tabular analysis (Polars), the
 `python/` package indexes any local tree of processed dirs
@@ -503,6 +556,16 @@ detectors) · `manifest.json` (`complete: true` ⇒ safe to drop raw;
 **`book_events` replay:** empty → `is_snapshot` row *sets* a level (absolute) →
 delta row `+= qty_centi` (signed; drop at 0). `event_idx` groups a message and
 joins to `book_top`.
+
+**`span_us`/`hole_us` (uptime):** `manifest.json` fields — `span_us` = the
+`book_events` extent (trades-fallback for trade-only dirs), `hole_us` = unioned
+span-clamped hole time (same rule as `coverage()`); uptime = `1 - hole_us /
+span_us`. `hole_us: null` = no book events; `span_us: 0` is a real value
+(guard the divide); keys **absent** = pre-`v0.3.0` manifest.
+
+**Clash-slot substitution:** `capture-universe` arms the owning daily/weekly
+contract in place of an hourly whose expiry the higher-cadence contract owns
+(`--clash-sub on`, default); Long cadence (monthly/annual) is always skipped.
 
 **Peek anywhere:** `kdp-process --head <file>.parquet --rows 20`.
 

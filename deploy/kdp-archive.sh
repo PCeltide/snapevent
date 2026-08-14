@@ -29,6 +29,10 @@ if [[ -f "$ENV_FILE" ]]; then set -a; . "$ENV_FILE"; set +a; fi
 : "${KDP_HOT_DAYS:=7}"
 : "${KDP_ALERT_WEBHOOK:=}"
 : "${KDP_SETTLE_MINUTES:=10}"
+# Seconds to wait for this session's checkpoint lock before giving up on the
+# destructive steps (see "checkpoint lock" below). A UTC-rollover checkpoint
+# runs minutes, not hours; the default is generous on purpose.
+: "${KDP_LOCK_WAIT:=900}"
 # Google Drive enforces a per-minute API query quota. A per-event folder holds
 # ~26 strikes x several files, so an unthrottled copy/check bursts past it and
 # 403s ("Quota exceeded ... Queries per minute"). Cap rclone's transaction rate
@@ -46,14 +50,19 @@ trap 'alert "unexpected abort at line $LINENO (no data deleted past this point)"
 
 command -v rclone >/dev/null || { alert "rclone not installed"; exit 1; }
 command -v jq     >/dev/null || { alert "jq not installed"; exit 1; }
+command -v flock  >/dev/null || { alert "flock not installed (util-linux)"; exit 1; }
 
 # archive_one <session> <explicit|sweep> [remote_prefix]
 archive_one() {
   local session="$1" mode="$2" remote_prefix="${3:-}"
-  # Empty/absent 3rd arg -> fall back to the env default (a passed empty string
-  # must NOT blank the remote -- ${3:-} above yields "" when the arg is absent).
+  local sdir="$KDP_DATA_DIR/$session" proc="$KDP_PROC_DIR/$session"
+  # Prefix resolution: explicit arg > the session's .remote-prefix marker (the
+  # supervisor persists its namespace there at unit start, so the SWEEP lands a
+  # recovered session in the same place the inline archive would have) > the
+  # bare env remote. An empty string never blanks the remote.
+  [[ -n "$remote_prefix" ]] || remote_prefix="$(head -n1 "$sdir/.remote-prefix" 2>/dev/null || true)"
   [[ -n "$remote_prefix" ]] || remote_prefix="$KDP_RCLONE_REMOTE"
-  local sdir="$KDP_DATA_DIR/$session" remote="$remote_prefix/$session" proc="$KDP_PROC_DIR/$session"
+  local remote="$remote_prefix/$session"
 
   [[ -d "$sdir" ]] || { log "$session: no data dir; skip"; return 0; }
   [[ -e "$sdir/.archived" ]] && { log "$session: already archived; skip"; return 0; }
@@ -76,8 +85,7 @@ archive_one() {
   # records (the market is settled): kdp-process finds no capture files and emits
   # no manifests. Uploading the resulting empty processed/ + empty raw tar would
   # CLOBBER a prior good archive on Drive (rclone copy/copyto overwrite by name).
-  # Bail BEFORE any upload -- a no-data session must never touch Drive. (See the
-  # prune/marker clobber post-mortem in docs/dev-context/open-items.md.)
+  # Bail BEFORE any upload -- a no-data session must never touch Drive.
   if ! compgen -G "$proc/*/manifest.json" >/dev/null; then
     log "$session: 0 tickers processed (no capture files); nothing to archive -- skip, no upload"
     return 0
@@ -121,7 +129,7 @@ archive_one() {
   local raw_ok=1
   if [[ "$KDP_BACKUP_RAW" == "1" ]]; then
     local tb; tb="$(mktemp --suffix=.tar.gz)"
-    if tar -C "$KDP_DATA_DIR" --exclude='.done' --exclude='.archived' -czf "$tb" "$session" \
+    if tar -C "$KDP_DATA_DIR" --exclude='.done' --exclude='.archived' --exclude='.remote-prefix' -czf "$tb" "$session" \
        && rclone copyto "$tb" "$remote/raw/$session.tar.gz" --checksum --retries 5 "${RCLONE_PACE[@]}"; then
       local lm rm; lm="$(md5sum "$tb" | cut -d' ' -f1)"; rm="$(rclone md5sum "$remote/raw/$session.tar.gz" "${RCLONE_PACE[@]}" | awk '{print $1}')"
       [[ -n "$rm" && "$lm" == "$rm" ]] || raw_ok=0
@@ -133,9 +141,44 @@ archive_one() {
     log "$session: raw backup verified on Drive"
   fi
 
+  # ---- checkpoint lock (held across BOTH destructive steps below) ----------
+  # kdp-checkpoint.sh copies $sdir -> <remote>/raw-inflight/ for this same
+  # session. Purging that remote dir, or deleting the local source under it,
+  # while a copy is in flight yields rclone "failed to open source object" for
+  # every file it has not reached yet: 1,062 such ERRORs at the 2026-08-09 UTC
+  # rollover, the first midnight after settlement started working. Mechanism:
+  # units now settle at close+grace instead of running to a backstop, so the
+  # archive fires ~4 min after the rollover checkpoint starts -- and across a
+  # day boundary every strike has TWO day-files, so the checkpoint takes ~2x
+  # as long and is still running. Nothing was lost (the authoritative upload
+  # had already verified, and rclone's own retry succeeded), but recurring
+  # ERROR noise is how people learn to stop reading ERROR.
+  #
+  # The checkpoint takes this same lock with `flock -n` and skips when it
+  # cannot: if the archive holds it, the session is being made durable right
+  # now and the checkpoint has nothing left to stand in for.
+  # umask 0 on the lock file: this script is the one plausibly run under sudo
+  # during an incident, and a root-owned lock would then make the kdp-user
+  # checkpoint die at `exec 9>` with Permission denied -- before it can alert.
+  install -d "$KDP_DATA_DIR/.locks"
+  local locked=1 _um
+  _um="$(umask)"; umask 0000; exec 9>"$KDP_DATA_DIR/.locks/$session.lock"; umask "$_um"
+  flock -w "$KDP_LOCK_WAIT" 9 || {
+    locked=0
+    alert "$session: checkpoint still running after ${KDP_LOCK_WAIT}s; archived but NOT pruned (local raw kept)"
+  }
+
+  if [[ "$KDP_BACKUP_RAW" == "1" ]] && (( locked == 1 )); then
+    # Superseded by the checksum-verified raw tar: drop the in-flight daily
+    # checkpoints (kdp-checkpoint.sh). Archive-verify failure returns above,
+    # so checkpoints survive exactly the failure they exist for. Usually the
+    # dir does not exist (short sessions) -- purge failure is non-fatal.
+    rclone purge "$remote/raw-inflight" "${RCLONE_PACE[@]}" >/dev/null 2>&1 || true
+  fi
+
   : > "$sdir/.archived"
 
-  if [[ "$KDP_PRUNE" == "1" && ( "$KDP_BACKUP_RAW" != "1" || "$raw_ok" == "1" ) ]] && (( incomplete == 0 )); then
+  if [[ "$KDP_PRUNE" == "1" && ( "$KDP_BACKUP_RAW" != "1" || "$raw_ok" == "1" ) ]] && (( incomplete == 0 )) && (( locked == 1 )); then
     log "$session: pruning local raw"
     # Remove the raw ticker SUBDIRS but KEEP the session dir + .done/.archived
     # markers. A full `rm -rf $session` would delete the .archived marker we just
@@ -145,8 +188,9 @@ archive_one() {
     # reaped by the nightly sweep once it ages past the arm window (below).
     find "${KDP_DATA_DIR:?}/$session" -mindepth 1 -maxdepth 1 -type d -exec rm -rf -- {} +
   else
-    log "$session: archived; local raw kept (KDP_PRUNE=$KDP_PRUNE, incomplete=$incomplete)"
+    log "$session: archived; local raw kept (KDP_PRUNE=$KDP_PRUNE, incomplete=$incomplete, locked=$locked)"
   fi
+  exec 9>&-
   notify "$session: archived to Drive ($remote)"
   return 0
 }
@@ -179,6 +223,8 @@ else
     find "$d" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q . && continue
     log "marker-stub reap $(basename "$d")"; rm -rf -- "$d"
   done < <(find "$KDP_DATA_DIR" -mindepth 1 -maxdepth 1 -type d -mtime "+${KDP_HOT_DAYS}" -print0 2>/dev/null)
+  # Reap aged checkpoint-lock stubs (one empty file per session, forever otherwise).
+  find "$KDP_DATA_DIR/.locks" -type f -name '*.lock' -mtime "+${KDP_HOT_DAYS}" -delete 2>/dev/null || true
 fi
 
 log "done."

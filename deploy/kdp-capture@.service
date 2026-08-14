@@ -14,6 +14,13 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+# One JSONL file stays open per (ticker, channel) for the life of a capture
+# unit, and at an hourly seam TWO cohorts are open at once -- so peak fd use is
+# ~4x the ticker count. systemd's default soft limit is 1024, which a
+# breadth capture blows through (observed 2026-08-01: capture-universe over
+# KXETHD+KXBTC halted mid-run with "Too many open files (os error 24)").
+# Capture is unrecoverable (ADR-003), so give it headroom it cannot reach.
+LimitNOFILE=65536
 Type=simple
 User=kdp
 Group=kdp

@@ -1,0 +1,31 @@
+# Python bindings over kdp-load. OUTSIDE the cargo workspace (see the root
+# manifest's `exclude`): pyo3's macro-generated FFI glue contains `unsafe`,
+# which the workspace-wide forbid(unsafe_code) lint cannot admit. This crate
+# contains NO hand-written unsafe code — pyo3 macros only.
+#
+# Version is pinned here (no workspace inheritance available): bump together
+# with [workspace.package] and python/pyproject.toml per the one-SemVer
+# policy (runbook-public-release.md).
+[package]
+name = "kdp-load-py"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[lib]
+name = "kdp_load"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+kdp-load = { path = "../kdp-load" }
+kdp-core = { path = "../kdp-core" }
+
+[features]
+default = []
+# Enabled by maturin via pyproject.toml; keeps plain `cargo check` linkable.
+extension-module = ["pyo3/extension-module"]
